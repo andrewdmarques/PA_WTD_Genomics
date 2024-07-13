@@ -1,0 +1,2285 @@
+---
+title: "White-Tailed Deer SARS-CoV-2 Analyis"
+output: pdf_document
+---
+
+```{r echo=FALSE, fig.cap="User Interaction", warning = FALSE, message = FALSE,include=FALSE}
+######################################################################################################
+# Required Packages
+######################################################################################################
+
+library(pander)
+library(readxl)
+library(ggplot2)
+library(scales) # For Color
+library(data.table) # This is for the county positivity table
+library(dplyr) # To aggregate data by date and used for the anatomy of the lymph node
+library(gridExtra) # Used to visualize the plots on the pdf output
+library(bayesplot) # Used in the anatomy of the lymph node section
+library(pdftools) # Used in the anatomy of the lymph node section
+library(brms) # Used in the anatomy of the lymph node section
+
+######################################################################################################
+# User Defined Variables
+######################################################################################################
+
+setwd("D:/Desktop/OneDrive/Bushman-Lab-Cloud/01_Experiments/Onging-Work/2023-08-10_WTD-2023-Project/Report-Generator")
+source('functions_main.R') # Functions needed to run the base report
+# source('functions_map.R') # Functions for the PA country positivity map
+# source('functions_prevalence-over-time.R') # needed for running the ARMA smoothing model
+# source('functions_anatomy.R') # Needed for the anatomy of the lymph node section.
+
+file_met1 <- '2024-05-02_rpln-metadata.csv' # Main metadata file
+file_old1 <- '2024-04-09_marques-deer-paper-2022.csv' # Optional metadata from previous studies
+file_temperture <- '2024-05-14_pa-region-temperature.csv'
+combine_old <- F # This will combine the data from the previous publication with the data from this publication.
+rerun <- F # This will rerun all the stats rather than use the saved files from the previous stats.
+
+# For recording data and plots
+prefix <- '2024-07-01'
+suffix <- 'v1'
+
+######################################################################################################
+# Data Cleaning
+######################################################################################################
+met1 <-  read.csv(file_met1) # The main metadata file
+
+# Create the directory hierarchy.
+dir_data_main <- paste0('./',prefix,'_Analysis_',suffix,'/')
+if (!file.exists(dir_data_main)) {dir.create(dir_data_main, recursive = TRUE)}
+
+if(combine_old == T){
+  old1 <- read.csv(file_old1)
+  met2 <- get_old_data(met1, old1)
+}else{
+  met2 <- met1
+}
+
+met2 <- met2[!grepl("VSP35", met2$VSP), ] # Remove the experimental samples.
+met2$Age[is.na(met2$Age) | met2$Age == ""] <- 'Undetermined'
+met2$Age <- factor(met2$Age,levels = c('Fawn','Yearling','Adult','Undetermined'))
+met2$IncidentDate <- as.Date(met2$IncidentDate)
+met2$Animalstatus[met2$Animalstatus == ""] <- "Undetermined"
+met2$Animalstatus <- gsub("Dead - Permitted", "Dead - Targeted Removal", met2$Animalstatus)
+met2$Animalstatus <- gsub('Dead - ', '', met2$Animalstatus)
+met2$Animalstatus <- gsub('Other', 'Undetermined', met2$Animalstatus)
+met2$Animalstatus <- gsub('Captive Escapee', 'Undetermined', met2$Animalstatus)
+met2$Animalstatus <- gsub('Unknown', 'Undetermined', met2$Animalstatus)  
+met2$Animalstatus <- gsub('Hunter / Trapper Harvest', 'Hunter / Trapper', met2$Animalstatus)
+met2$Sex <- met2$Gender
+met2$Sex <- gsub("Unknown","Undetermined",met2$Sex)
+met2$Sex[met2$Sex == ""] <- "Undetermined"
+met2$positive <- met2$sars_cov_2
+met2$positive <- gsub('pos','Positive',met2$positive)
+met2$positive <- gsub('neg','Negative',met2$positive)
+met2$YearMonth <- format(met2$IncidentDate, "%B %Y")
+met2$latitude_new <- met2$Longitude
+met2$longitude_new <- met2$Latitude
+met2$cwd <- met2$CWD
+met2$cwd[met2$cwd == ""] <- "Undetermined"
+met2 <- met2[!grepl(pattern = "extraction error", x = met2$notes, ignore.case = TRUE), ]
+# Get the season information.
+met2$date_day <- as.numeric(strftime(met2$IncidentDate, format = "%j"))
+met2$season <- 'winter'
+met2$season <- ifelse(met2$date_day >= 355 | met2$date_day < 78, 'winter',
+              ifelse(met2$date_day >= 78 & met2$date_day < 172, 'spring',
+              ifelse(met2$date_day >= 172 & met2$date_day < 265, 'summer', 'fall')))
+met2$season[is.na(met2$date_day)] <- 'Undetermined'
+
+
+# met3 is the curated form of surveillance data all biobanked samples tested and untested.
+met3 <- met2
+
+# met4 is the curated form of the surveillance data that has been tested.
+met4 <- subset(met3,met3$sars_cov_2 != "")
+write.csv(met4,paste0(dir_data_main,prefix,'_metadata-tested-samples_',suffix,'.csv'))
+
+######################################################################################################
+# Time
+######################################################################################################
+# Calculate x-axis bounds
+start_date <- min(met4$IncidentDate, na.rm = TRUE) - 30  # 1 month before
+end_date <- max(met4$IncidentDate, na.rm = TRUE) + 30   # 1 month after
+
+plot_time <- ggplot(met4, aes(x = IncidentDate, y = n1_average_ct)) +
+  geom_point() + 
+  scale_x_date(date_breaks = "1 month", 
+               date_labels = "%B %Y",
+               expand = c(0, 0),
+               limits = c(start_date, end_date)) + 
+  scale_y_continuous(limits = c(0, 40), name = "Ct") + 
+  labs(x = "") +  # This will remove the x-axis title
+  theme_classic()  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Aggregate data to get counts of positive and negative cases by month
+summary_data <- table(met3$YearMonth, met3$positive)
+
+# Convert table to data.frame for ggplot
+summary_data_df <- as.data.frame(as.table(summary_data))
+names(summary_data_df) <- c("YearMonth", "Positive", "Counts")
+
+# Map positive and negative to desired labels
+summary_data_df$Positive <- factor(summary_data_df$Positive, levels = c("Negative", "Positive"), labels = c("Negative", "Positive"))
+
+# Make sure the YearMonth factor is ordered chronologically
+all_months <- seq.Date(from=start_date, to=end_date, by="month")
+all_months <- unique(format(all_months, "%B %Y"))
+
+# Now, ensure all months are present in the summary data
+all_months_df <- data.frame(YearMonth = all_months)
+summary_data_df <- merge(all_months_df, summary_data_df, by="YearMonth", all.x=TRUE)
+summary_data_df$Count[is.na(summary_data_df$Count)] <- 0  # fill NA counts with 0
+summary_data_df$Positive[is.na(summary_data_df$Positive)] <- "Negative"
+
+# Ensure YearMonth is an ordered factor based on the sequence we generated
+summary_data_df$YearMonth <- factor(summary_data_df$YearMonth, levels=all_months)
+
+summary_data_df$YearMonth2 <- as.POSIXct(paste(as.character(summary_data_df$YearMonth), "01"), format = "%B %Y %d")
+
+# Continue with plotting as before...
+plot_prevalence <- ggplot(summary_data_df, aes(x = YearMonth2, y = Count, fill = Positive)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("Negative" = "lightblue", "Positive" = "darkred")) +
+  labs(x = "", y = "Counts", fill = "SARS-CoV-2 Positivity") +
+  scale_x_datetime(date_labels = "%b %Y", date_breaks = "2 months", date_minor_breaks = "1 month", expand = c(0, 0)) +
+  theme_classic()  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_prevalence-raw_',suffix,'.pdf'),plot_prevalence,width = 6, height = 3)
+
+# Compute total counts and positive counts for each month
+total_counts <- tapply(summary_data_df$Count, summary_data_df$YearMonth, sum)
+positive_counts <- tapply(summary_data_df$Count[summary_data_df$Positive == "Positive"], 
+                          summary_data_df$YearMonth[summary_data_df$Positive == "Positive"], sum)
+met4_curated <- subset(met4,!is.na(met3$IncidentDate))
+
+# Prepare the data
+n_total <- length(met4_curated$positive)
+n_positive <- sum(met4_curated$positive == "Positive")
+
+# Data preparation: aggregate data by date
+met4_curated_agg <- met4_curated %>%
+  group_by(IncidentDate) %>%
+  summarise(n_positive = sum(positive == "Positive"),
+            n_total = n())
+
+######################################################################################################
+# Get information for reporting data progress.
+######################################################################################################
+# Number of samples biobanked.
+dat_biobank <- nrow(met2)
+
+# Number of samples that qPCR was performed on.
+dat_qpcr <- nrow(met4)
+
+# Number of samples that were attempted HiCt on.
+temp1 <- subset(met4,met4$hict_prep != '')
+temp1 <- subset(temp1,temp1$hict_lineage != '')
+dat_hict_attempt <- nrow(temp1)
+
+# Number of samples that were failed HiCt because of PCR failure.
+temp2 <- subset(temp1,temp1$hict_lineage == 'failed_pcr')
+dat_hict_failed_pcr <- nrow(temp2)
+
+# Number of samples that failed HiCt because of poor Sanger results.
+temp3 <- subset(temp1,temp1$hict_lineage == 'failed_sanger')
+dat_hict_failed_sanger <- nrow(temp3)
+
+# Number of samples that were successful with HiCt.
+temp4 <- subset(temp1,temp1$hict_lineage != 'failed_sanger' & temp1$hict_lineage != 'failed_pcr')
+dat_hict_success <- nrow(temp4)
+
+# Number of samples attempted WGS.
+temp1 <- subset(met4,met4$wgs_prep != '')
+dat_wgs_attempt <- nrow(temp1)
+
+# Number of samples failed WGS.
+temp2 <- subset(temp1,temp1$wgs_lineage == 'failed_wgs')
+dat_wgs_failed <- nrow(temp2)
+
+# Number of samples successfully WGS.
+temp3 <- subset(temp1,temp1$wgs_lineage != 'failed_wgs')
+dat_wgs_cut_off <- 70
+temp4 <- subset(temp3,temp3$wgs_percent_5x_coverage >= dat_wgs_cut_off)
+dat_wgs_success <- nrow(temp4)
+
+# Final count of HiCt sequences used.
+dat_hict_final <- dat_hict_success - dat_wgs_success
+
+# Total number of variant calls
+dat_tot_variant <- dat_hict_final
+
+# Number of samples tested for sVNT
+dat_sera_tests <- nrow(subset(met1,met1$svnt_result != ''))
+
+# Number of seropositive samples
+dat_sera_pos <- nrow(subset(met1,met1$svnt_result == 'pos'))
+
+######################################################################################################
+# Death
+######################################################################################################
+# Make cause of death table
+met4_temp <- subset(met4,met4$Animalstatus != 'Undetermined')
+death1 <- data.frame(table(met4_temp$Animalstatus))
+colnames(death1) <- c('Cause','Counts')
+death2 <- subset(met4_temp,met4_temp$sars_cov_2 == 'pos')
+death3 <- data.frame(table(death2$Animalstatus))
+colnames(death3) <- c('Cause','Counts_Positive')
+death3$Cause <- as.character(death3$Cause)
+# Combine the data together.
+death4 <- death1
+death4$Counts_Positive <- 0
+for(ii in 1:nrow(death4)){
+  tt <- death4$Cause[ii]
+  temp <- subset(death3,death3$Cause == tt)
+  if(nrow(temp) > 0){
+    death4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+death4$Cause <- as.character(death4$Cause)
+death4$Cause[is.na(death4$Cause) | death4$Cause == ""] <- "Unknown"
+death4$Percent_Positive <- paste0(as.character(round(death4$Counts_Positive/death4$Counts * 100,2)),'%')
+met4_temp <- subset(met4, !met4$Animalstatus %in% c('Disease Suspect','Undetermined'))
+plot_death <- ggplot(met4_temp, aes(x = Animalstatus, y = n1_average_ct)) +
+  geom_jitter(width = 0.2, height = 0, color = "black", size = 0.2) +
+  geom_boxplot(fill = "gray", alpha = 0.5, width = 0.5, outlier.shape = NA) +
+  labs(x = "Cause of Death", y = "Ct") +
+  ggtitle(" ") +
+  theme_classic()  +
+  ylim(20, 40) +  # Set the y-axis limits
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())  # Rotate x-axis labels
+
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_death_',suffix,'.pdf'),plot_death,width = 6, height = 3)
+
+# Determine if cause of death is statistically significant.
+met4_temp <- met4
+met4_temp$Animalstatus <- as.character(met4_temp$Animalstatus)
+met4_temp <- subset(met4_temp,met4_temp$Animalstatus != 'Undetermined')
+anova_result_death <- aov(n1_average_ct ~ Animalstatus, data = met4_temp)
+tukey_result_death <- TukeyHSD(anova_result_death)
+# summary(anova_result_death)
+# tukey_result_death
+
+# Test if there is a difference in proportion.
+table_death <- table(met4_temp$Animalstatus, met4_temp$sars_cov_2)
+# Perform the Chi-squared test
+chi_death <- chisq.test(table_death)
+# Run post hoc test
+bon_post_hoc_death <- pairwise.prop.test(x = table_death, p.adjust.method = "bonferroni")
+
+#make count table
+qpcr_death <- subset(met4, !met4$Animalstatus %in% c('Undetermined','Disease Suspect'))
+levels_death <- sort(unique(qpcr_death$Animalstatus))
+qpcr_death$Animalstatus <- factor(qpcr_death$Animalstatus,levels = levels_death)
+qpcr_table_death <- data.frame(table(qpcr_death$sars_cov_2, qpcr_death$Animalstatus))
+colnames(qpcr_table_death) <- c('qpcr_result', "Animalstatus", "Freq")
+
+plot_qpcr_death <- ggplot(qpcr_table_death, aes(fill = qpcr_result, y = Freq, x = Animalstatus)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title='Cause of Death', x = "", y = "qPCR Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+######################################################################################################
+# Age
+######################################################################################################
+# Make table for age.
+age1 <- subset(met4,met4$sars_cov_2 == 'pos')
+age_t1 <- data.frame(table(age1$Age))
+age_t2 <- data.frame(table(met4$Age)) 
+
+# Make a blank data frame.
+col <- c('Age', 'Counts', 'Counts_Positive','Percent_Positive')
+row <- unique(met4$Age)
+age2 <- data.frame(matrix(0, nrow = length(row), ncol = length(col)))
+colnames(age2) <- col
+age2$Age <- row
+age2$Counts <- age_t2$Freq
+age2$Counts_Positive <- age_t1$Freq
+age2$Percent_Positive <- paste0(as.character(round(age2$Counts_Positive/age2$Counts * 100,2)),'%')
+
+age3 <- age2
+age3 <- subset(age3,age3$Age != 'Undetermined')
+
+# Plotting
+met3_temp <- subset(met3,met3$Age != 'Undetermined')
+plot_age <- ggplot(met3_temp, aes(x = Age, y = n1_average_ct)) +
+  geom_jitter(width = 0.2, height = 0, color = "black", size = 0.2) +
+  geom_boxplot(fill = "gray", alpha = 0.5, width = 0.5, outlier.shape = NA) +
+  labs(x = "", y = "Ct") +
+  ggtitle(" ") +
+  theme_classic()  +
+  ylim(20, 40) +  # Set the y-axis limits
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())  # Rotate x-axis labels
+
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_age_',suffix,'.pdf'),plot_age,width = 6, height = 3)
+
+# Determine if age is statistically significant.
+met4_temp <- subset(met4,met4$sars_cov_2 == 'pos')
+met4_temp$Age <- as.character(met4_temp$Age)
+met4_temp <- subset(met4_temp,met4_temp$Age != 'Undetermined')
+anova_result_age <- aov(n1_average_ct ~ Age, data = met4_temp)
+tukey_result_age <- TukeyHSD(anova_result_age)
+# tukey_result_age
+# summary(anova_result_age)
+
+dat_total_samples <- nrow(met4)
+dat_date <- subset(met4$IncidentDate,!is.na(met4$IncidentDate))
+dat_date_min <- as.character(format(min(dat_date), "%m/%d/%Y"))
+dat_date_max <- as.character(format(max(dat_date), "%m/%d/%Y"))
+dat_pos <- subset(met4,met4$sars_cov_2 == 'pos')
+dat_neg <- subset(met4,met4$sars_cov_2 == 'neg')
+dat_rate <- round(100*nrow(dat_pos)/(nrow(dat_pos)+nrow(dat_neg)),2)
+temp <- subset(met4,met4$CountyValue != '')
+dat_county <- length(unique(temp$CountyValue))
+
+# Test if there is a difference in proportion.
+met4_temp <- subset(met4,met4$Age != 'Undetermined')
+met4_temp$Age <- as.character(met4_temp$Age)
+table_age <- table(met4_temp$Age, met4_temp$sars_cov_2)
+# Perform the Chi-squared test
+chi_age <- chisq.test(table_age)
+# Run post hoc test
+chi_post_hoc_age <- pairwise.prop.test(x = table_age, p.adjust.method = "bonferroni")
+
+#make count table
+qpcr_age <- subset(met4,met4$Age != 'Undetermined')
+levels_age <- c('Fawn','Yearling','Adult')
+qpcr_age$Age <- factor(qpcr_age$Age,levels = levels_age)
+qpcr_table_age <- data.frame(table(qpcr_age$sars_cov_2, qpcr_age$Age))
+colnames(qpcr_table_age) <- c('qpcr_result', "Age", "Freq")
+
+plot_qpcr_age <- ggplot(qpcr_table_age, aes(fill = qpcr_result, y = Freq, x = Age)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Age',x = "", y = "qPCR Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+plot_qpcr_age <- ggplot(qpcr_table_age, aes(fill = qpcr_result, y = Freq, x = Age)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Age',x = "", y = "qPCR Counts", fill = "Positivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+
+######################################################################################################
+# Sex
+######################################################################################################
+
+# Make cause of death table
+sex1 <- data.frame(table(met4$Sex))
+colnames(sex1) <- c('Sex','Counts')
+sex2 <- subset(met4,met4$sars_cov_2 == 'pos')
+sex3 <- data.frame(table(sex2$Sex))
+colnames(sex3) <- c('Sex','Counts_Positive')
+sex3$Sex <- as.character(sex3$Sex)
+# Combine the data together.
+sex4 <- sex1
+sex4$Counts_Positive <- 0
+for(ii in 1:nrow(sex4)){
+  tt <- sex4$Sex[ii]
+  temp <- subset(sex3,sex3$Sex == tt)
+  if(nrow(temp) > 0){
+    sex4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+sex4$Sex <- as.character(sex4$Sex)
+sex4$Sex[is.na(sex4$Sex) | sex4$Sex == ""] <- "Unknown"
+sex4$Percent_Positive <- paste0(as.character(round(sex4$Counts_Positive/sex4$Counts * 100,2)),'%')
+sex4 <- subset(sex4,sex4$Sex != 'Undetermined')
+
+# Plotting
+met4_temp <- subset(met4,met4$Sex != 'Undetermined')
+plot_sex <- ggplot(met4_temp, aes(x = Sex, y = n1_average_ct)) +
+  geom_jitter(width = 0.2, height = 0, color = "black", size = 0.2) +
+  geom_boxplot(fill = "gray", alpha = 0.5, width = 0.5, outlier.shape = NA) +
+  labs(x = "Sex", y = "Ct") +
+  ggtitle(" ") +
+  theme_classic()  +
+  ylim(20, 40) +  # Set the y-axis limits
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())  # Rotate x-axis labels
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_age_',suffix,'.pdf'),plot_age,width = 6, height = 3)
+
+# Determine if sex is statistically significant.
+met4_temp <- met4
+met4_temp$Sex <- as.character(met4_temp$Sex)
+met4_temp <- subset(met4_temp, met4_temp$Sex %in% c('Male', 'Female'))
+met4_temp <- subset(met4_temp,met4_temp$Sex != 'Undetermined')
+t_test_result_sex <- t.test(n1_average_ct ~ Sex, data = met4_temp)
+
+# # Test if there is a difference in proportion.
+# table_sex <- table(met3$Sex, met3$sars_cov_2)
+# # Perform the Chi-squared test
+# chi_age <- chisq.test(table_sex)
+# # Run post hoc test
+# chi_post_hoc_sex <- pairwise.prop.test(x = table_sex, p.adjust.method = "bonferroni")
+# Create a table:
+met4_temp <- subset(met4, met4$Sex %in% c('Male', 'Female'))
+table_sex <- table(met4_temp$Sex, met4_temp$sars_cov_2)
+# Then you run the prop.test
+# The x argument is the number of successes (e.g., "Positive") for each group,
+# and the n argument is the total number of cases for each group.
+prop_test_sex <- prop.test(x = c(table_sex[1,2], table_sex[2,2]), 
+                           n = c(sum(table_sex[1,]), sum(table_sex[2,])))
+
+#make count table
+qpcr_sex <- subset(met4,met4$Sex != 'Undetermined')
+levels_sex <- unique(qpcr_sex$Sex)
+qpcr_sex$Age <- factor(qpcr_sex$Age,levels = levels_sex)
+qpcr_table_sex <- data.frame(table(qpcr_sex$sars_cov_2, qpcr_sex$Sex))
+colnames(qpcr_table_sex) <- c('qpcr_result', "Sex", "Freq")
+
+plot_qpcr_sex <- ggplot(qpcr_table_sex, aes(fill = qpcr_result, y = Freq, x = Sex)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Sex',x = "", y = "qPCR Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+######################################################################################################
+# Seasonality
+######################################################################################################
+
+# Make Season table
+met4_temp <- subset(met4,met4$season != 'Undetermined')
+sea0 <- met4_temp
+sea0$season <- factor(sea0$season,levels = c('spring','summer','fall','winter'))
+sea1 <- data.frame(table(sea0$season))
+colnames(sea1) <- c('Season','Counts')
+sea2 <- subset(met4_temp,met4_temp$sars_cov_2 == 'pos')
+sea3 <- data.frame(table(sea2$season))
+colnames(sea3) <- c('Season','Counts_Positive')
+sea3$Season <- as.character(sea3$Season)
+# Combine the data together.
+sea4 <- sea1
+sea4$Counts_Positive <- 0
+for(ii in 1:nrow(sea4)){
+  tt <- sea4$Season[ii]
+  temp <- subset(sea3,sea3$Season == tt)
+  if(nrow(temp) > 0){
+    sea4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+sea4$Season <- as.character(sea4$Season)
+sea4$Season[is.na(sea4$Season) | sea4$Season == ""] <- "Unknown"
+sea4$Percent_Positive <- paste0(as.character(round(sea4$Counts_Positive/sea4$Counts * 100,2)),'%')
+met4_temp <- subset(met4,met4$season != 'Undetermined')
+met4_temp$season <-  factor(met4_temp$season,levels = c('spring','summer','fall','winter'))
+plot_sea <- ggplot(met4_temp, aes(x = season, y = n1_average_ct)) +
+  geom_jitter(width = 0.2, height = 0, color = "black", size = 0.2) +  # Adjusted size
+  geom_boxplot(fill = "gray", alpha = 0.5, width = 0.5, outlier.shape = NA) +
+  labs(x = "Season", y = "Ct") +
+  ggtitle(" ") +
+  theme_classic()  +
+  ylim(20, 40) +  # Set the y-axis limits
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())  # Rotate x-axis labels
+
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_season_',suffix,'.pdf'),plot_sea,width = 6, height = 3)
+
+# Determine if Season is statistically significant.
+met4_temp <- met4
+met4_temp$season <- as.character(met4_temp$season)
+met4_temp <- subset(met4_temp,met4_temp$season != 'Undetermined')
+anova_result_sea <- aov(n1_average_ct ~ season, data = met4_temp)
+tukey_result_sea <- TukeyHSD(anova_result_sea)
+# summary(anova_result_sea)
+# tukey_result_sea
+
+# Test if there is a difference in proportion.
+table_sea <- table(met4_temp$season, met4_temp$sars_cov_2)
+# Perform the Chi-squared test
+chi_sea <- chisq.test(table_sea)
+# Run post hoc test
+bon_post_hoc_sea <- pairwise.prop.test(x = table_sea, p.adjust.method = "bonferroni")
+
+#make count table
+qpcr_sea <- subset(met4_temp,met4_temp$season != 'Undetermined')
+levels_sea <- c('spring','summer','fall','winter')
+qpcr_sea$season <- factor(qpcr_sea$season,levels = levels_sea)
+qpcr_table_sea <- data.frame(table(qpcr_sea$sars_cov_2, qpcr_sea$season))
+colnames(qpcr_table_sea) <- c('qpcr_result', "season", "Freq")
+
+plot_qpcr_sea <- ggplot(qpcr_table_sea, aes(fill = qpcr_result, y = Freq, x = season)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Season',x = "", y = "qPCR Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+#####################################################################################################
+# CWD
+######################################################################################################
+# Make table for CWD
+# Make cause of death table
+cwd1 <- data.frame(table(met4$cwd))
+colnames(cwd1) <- c('cwd','Counts')
+cwd2 <- subset(met4,met4$sars_cov_2 == 'pos')
+cwd3 <- data.frame(table(cwd2$cwd))
+colnames(cwd3) <- c('cwd','Counts_Positive')
+cwd3$cwd <- as.character(cwd3$cwd)
+# Combine the data together.
+cwd4 <- cwd1
+cwd4$Counts_Positive <- 0
+for(ii in 1:nrow(cwd4)){
+  tt <- cwd4$cwd[ii]
+  temp <- subset(cwd3,cwd3$cwd == tt)
+  if(nrow(temp) > 0){
+    cwd4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+cwd4$cwd <- as.character(cwd4$cwd)
+cwd4$cwd[is.na(cwd4$cwd) | cwd4$cwd == ""] <- "Unknown"
+cwd4$Percent_Positive <- paste0(as.character(round(cwd4$Counts_Positive/cwd4$Counts * 100,2)),'%')
+
+# Plotting
+plot_cwd <- ggplot(met4, aes(x = cwd, y = n1_average_ct)) +
+  geom_jitter(width = 0.2, height = 0, color = "black", size = 3) +
+  geom_boxplot(fill = "gray", alpha = 0.5, width = 0.5, outlier.shape = NA) +
+  labs(x = "cwd", y = "Ct") +
+  ggtitle(" ") +
+  theme_classic()  +
+  ylim(20, 40) +  # Set the y-axis limits
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_cwd_',suffix,'.pdf'),plot_cwd,width = 6, height = 3)
+
+# Determine if cwd is statistically significant.
+met4_temp <- met4
+met4_temp$cwd <- as.character(met4_temp$cwd)
+met4_temp <- subset(met4_temp, met4_temp$cwd %in% c('pos', 'neg'))
+met4_temp <- subset(met4_temp,met4_temp$sars_cov_2 == 'pos')
+t_test_result_cwd <- t.test(n1_average_ct ~ cwd, data = met4_temp)
+
+# Test if there is a difference in proportion.
+met4_temp <- subset(met4, met4$cwd %in% c('pos', 'neg'))
+table_cwd <- table(met4_temp$cwd, met4_temp$sars_cov_2)
+# Then you run the prop.test
+# The x argument is the number of successes (e.g., "Positive") for each group,
+# and the n argument is the total number of cases for each group.
+prop_test_cwd <- prop.test(x = c(table_cwd[1,2], table_cwd[2,2]), 
+                           n = c(sum(table_cwd[1,]), sum(table_cwd[2,])))
+
+# #make count table
+# qpcr_cwd <- subset(met4,met4$cwd != 'Undetermined')
+# levels_cwd <- unique(qpcr_cwd$cwd)
+# qpcr_cwd$Age <- factor(qpcr_cwd$Age,levels = levels_cwd)
+# qpcr_table_cwd <- data.frame(table(qpcr_cwd$sars_cov_2, qpcr_cwd$cwd))
+# colnames(qpcr_table_cwd) <- c('qpcr_result', "cwd", "Freq")
+# 
+# plot_qpcr_cwd <- ggplot(qpcr_table_cwd, aes(fill = qpcr_result, y = Freq, x = cwd)) +
+#   geom_bar(position = "stack", stat = "identity") +
+#   labs(title = 'CWD',x = "cwd", y = "qPCR Counts", fill = "Seropositivity") + 
+#   scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+#   theme_classic() +
+#   theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+######################################################################################################
+# Geography in Pennsylvania 
+######################################################################################################
+
+# Create a scatter plot
+plot_geo <- ggplot(met3, aes(x = latitude_new, y = longitude_new)) +
+  geom_point(aes(color = ifelse(positive == 'Positive', "Positive", "Negative")), size = 1) +
+  scale_color_manual(values = c("Positive" = "red", "Negative" = "grey")) +
+  labs(x = "Longitude", y = "Latitude", color = "SARS-CoV-2 Positivity") +
+  theme_classic()  +
+  theme(legend.title = element_text(face = "bold"))
+
+# Given text
+text <- read.table('2023-09-14_pa-coorindates.txt',sep = '%')
+text <- text[1,1]
+
+# Extract numeric values
+coords <- as.numeric(unlist(regmatches(text, gregexpr("[-]?[0-9]+[.][0-9]+", text))))
+
+# Reshape to get x and y columns
+pa1 <- data.frame(x = coords[seq(1, length(coords), 2)],
+                 y = coords[seq(2, length(coords), 2)])
+
+plot_geo <- plot_geo + geom_polygon(data = pa1, aes(x = x, y = y), fill = NA, color = "black") +
+  coord_fixed(ratio = 1)+
+  theme_classic() 
+
+plot_geo2 <- plot_geo
+# Save plot
+ggsave(paste0(dir_data_main,prefix,'_plot_geography-raw_',suffix,'.pdf'),plot_geo2,width = 6, height = 3)
+
+county <- met4
+county$CountyValue <- ifelse(county$CountyValue == "", "Undetermined", county$CountyValue)
+county$CountyValue <- ifelse(county$CountyValue == "UNK/OUT OF STATE", "Undetermined", county$CountyValue)
+table_county <- table(county$CountyValue,met4$sars_cov_2)
+# Step 1: Extract 'neg' and 'pos' columns. This step may vary depending on the actual structure of 'table_county'
+neg <- table_county[, "neg"] # Assuming 'neg' is the name or index of the negative cases column
+pos <- table_county[, "pos"] # Assuming 'pos' is the name or index of the positive cases column
+
+# Step 2: Create a new data frame
+county_df <- data.frame(neg = neg, pos = pos)
+
+# Step 3: Calculate 'total' and 'prevalence'
+county_df$total <- county_df$neg + county_df$pos
+# county_df$prop <- county_df$pos / county_df$total
+county_df$prevalence <- paste0(as.character(round((county_df$pos / county_df$total) * 100,2)),'%')
+county_df$County <- rownames(county_df)
+colnames(county_df) <- c('Negative','Positive','Total','Prevalence','County')
+# Rearrange the columns to make 'County' the first column
+county_df <- county_df[c("County", setdiff(names(county_df), "County"))]
+county_df <- county_df[ , -which(names(county_df) %in% c('Negative'))]
+
+# Add the 95% confidence interval
+county_df$ci_95 <- '0%-100%'
+for(ii in 1:nrow(county_df)){
+  # Calculate the 95% Confidence Interval for psoitivity rate by county.
+  temp <- prop.test(county_df$Positive[ii],county_df$Total[ii])
+  temp_low <- as.character(paste0(round(100*temp$conf.int[1],2),'%'))
+  temp_high <- as.character(paste0(round(100*temp$conf.int[2],2),'%'))
+  
+  # Populate the data frame.
+  county_df$ci_95[ii] <- paste0('(',temp_low,'-',temp_high,')')
+}
+colnames(county_df) <- c('County','Positive','Total','Prevalence','95% CI')
+table_county2 <- as.data.table(county_df)
+
+# XXX 2024-05-17 To help make labels better
+map1 <- subset(met1,met1$seq_variant != '')
+map1$date_temp <- as.Date(map1$IncidentDate)
+# Create the new month_year column
+map1$month_year <- paste(format(map1$date_temp, "%Y"), format(map1$date_temp, "%m"),format(map1$date_temp, "%B"))
+map2 <- data.frame(table(map1$seq_variant,map1$CountyValue,map1$month_year))
+colnames(map2) <- c('variant','county','date','count')
+map3 <- subset(map2,map2$count != 0)
+map3 <- subset(map3,map3$county != '')
+map3 <- map3[order(map3$variant, decreasing = F),]
+map3 <- map3[order(map3$date, decreasing = F),]
+map3 <- map3[order(map3$county, decreasing = F),]
+write.csv(map3,paste0(dir_data_main,prefix,'_table_geography-variants-for-map-labeling_',suffix,'.csv'),row.names = F)
+################################################################################
+# Variant table by date
+################################################################################
+temp1 <- subset(met4,met4$seq_variant != '') # Work with only samples that have variant information.
+# Get the chronological order.
+temp1$month <- format(temp1$IncidentDate, "%B %Y")
+unique_dates <- unique(temp1$month)
+unique_dates <- unique_dates[order(as.Date(paste0("01 ", unique_dates), "%d %B %Y"))]
+temp1$month <- factor(temp1$month, levels = unique_dates, ordered = TRUE)
+# Make a table.
+temp2 <- table(temp1$month,temp1$seq_variant)
+write.table(temp2,paste0(dir_data_main,prefix,'_temp_variant_date_',suffix,'.csv'),sep=',')
+temp3 <- read.csv(paste0(dir_data_main,prefix,'_temp_variant_date_',suffix,'.csv'))
+temp3$Date <- rownames(temp3)
+temp3 <- temp3[, c(ncol(temp3), 1:(ncol(temp3) - 1))]  # Reorder columns so date appears first
+# temp3[temp3 == 0] <- '' # Make it so that if there was no counts detected then it appears as blank.
+row.names(temp3) <- NULL
+write.csv(temp3,paste0(dir_data_main,prefix,'_temp_variant_date_',suffix,'.csv'))
+table_var_date <- temp3
+rownames(table_var_date) <- NULL
+
+################################################################################
+# Variant table by county
+################################################################################
+temp1 <- subset(met4,met4$seq_variant != '') # Work with only samples that have variant information.
+# Make a table.
+temp2 <- table(temp1$CountyValue,temp1$seq_variant)
+write.table(temp2,paste0(dir_data_main,prefix,'_temp_variant_county_',suffix,'.csv'),sep=',')
+temp3 <- read.csv(paste0(dir_data_main,prefix,'_temp_variant_county_',suffix,'.csv'))
+temp3$County <- rownames(temp3)
+temp3 <- temp3[, c(ncol(temp3), 1:(ncol(temp3) - 1))]  # Reorder columns so date appears first
+# temp3[temp3 == 0] <- '' # Make it so that if there was no counts detected then it appears as blank.
+table_var_county <- temp3
+rownames(table_var_county) <- NULL
+
+################################################################################
+# Positivity rate by year.
+################################################################################
+dat <- met4
+dat21 <- subset(dat,dat$IncidentDate < as.Date('2022-01-01'))
+dat22 <- subset(dat,dat$IncidentDate < as.Date('2023-01-01'))
+dat22 <- subset(dat22,dat22$IncidentDate >= as.Date('2022-01-01'))
+dat23 <- subset(dat,dat$IncidentDate < as.Date('2024-01-01'))
+dat23 <- subset(dat23,dat23$IncidentDate >= as.Date('2023-01-01'))
+dat24 <- subset(dat,dat$IncidentDate >= as.Date('2024-01-01'))
+
+var_df <- subset(met4,met4$seq_variant != '')
+var_tab <- table(var_df$seq_variant)
+var_date_table <- table(var_df$IncidentDate,var_df$seq_variant)
+
+######################################################################################################
+# Serology Tests (Originally coded by MH, adapted by ADM)
+######################################################################################################
+
+sera_test <- subset(met4,met4$svnt_result != '')
+
+################ SARS-CoV-2 qPCR /serology Positivity
+#make count table
+sera_test_assay <- sera_test
+sera_test_assay$sars_cov_2 <- gsub('neg','Neg',sera_test_assay$sars_cov_2)
+sera_test_assay$sars_cov_2 <- gsub('pos','Pos',sera_test_assay$sars_cov_2)
+sera_test_assay$svnt_result <- gsub('neg','Neg',sera_test_assay$svnt_result)
+sera_test_assay$svnt_result <- gsub('pos','Pos',sera_test_assay$svnt_result)
+PositivityTable <- data.frame(table(sera_test$sars_cov_2, sera_test$svnt_result))
+colnames(PositivityTable) <- c("qpcr_result", 'svnt_result', "Freq")
+
+
+# Determine the number ab positive by SARS-CoV-2 Positivity
+assay0 <- table(sera_test$sars_cov_2, sera_test$svnt_result)
+assay1 <- data.frame(table(sera_test$sars_cov_2, sera_test$svnt_result))
+rr <- paste0('qPCR ',unique(as.character(assay1$Var1)))
+cc <- c('name',unique(as.character(assay1$Var2)))
+
+# Make a blank data frame
+assay2 <- data.frame(matrix(NA, nrow = length(rr), ncol = length(cc)))
+colnames(assay2) <- cc
+assay2$name <- rr
+
+# Populate the data frame.
+for(kk in 1:nrow(assay2)){
+  tt <- assay2$name[kk]
+  temp1 <- subset(assay1,paste0('qPCR ',assay1$Var1) == tt)
+  for(ll in 1:nrow(temp1)){
+    assay2[kk,ll+1] <- temp1$Freq[ll]
+  }
+}
+
+# Make the table for reporting.
+sera_table_assays <- assay2
+rownames(sera_table_assays) <- sera_table_assays$name
+sera_table_assays <- sera_table_assays[ , -which(names(sera_table_assays) %in% c('name'))]
+colnames(sera_table_assays) <- c('Sera neg','Sera pos')
+sera_table_assays$Result <- rownames(sera_table_assays)
+rownames(sera_table_assays) <- NULL
+
+write.csv(assay2,paste0(dir_data_main,prefix,'_table_antibody-positivity_summary',suffix,'.csv'))
+
+sera_prop_test_assay <- prop.test(x = c(assay0[1,2], assay0[2,2]), 
+                           n = c(sum(assay0[1,]), sum(assay0[2,])))
+
+#begin barplots
+plot_sera_positivity_assays <- ggplot(PositivityTable, aes(fill = svnt_result, y = Freq, x = qpcr_result)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'qPCR vs Serology',x = "qPCR Result", y = "Serology Counts", fill = 'svnt_result') + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),plot.title = element_text(hjust = 0.5))
+
+################ Serology by Age
+
+#run chi
+sera_test_age <- sera_test
+sera_test_age <- subset(sera_test_age,sera_test_age$Age != 'Undetermined')
+sera_test_age$Age <- factor(sera_test_age$Age,levels = c('Fawn','Yearling','Adult'))
+sera_table_age2 <- table(sera_test_age$Age, sera_test_age$svnt_result)
+# Perform the Chi-squared test
+chi_sera_age <- chisq.test(sera_table_age2)
+# Run post hoc test
+sera_chi_post_hoc_age <- pairwise.prop.test(x = sera_table_age2, p.adjust.method = "bonferroni")
+
+#make count table
+sera_table_age <- data.frame(table(sera_test_age$svnt_result, sera_test_age$Age))
+colnames(sera_table_age) <- c('svnt_result', "Age", "Freq")
+
+plot_sera_age <- ggplot(sera_table_age, aes(fill = svnt_result, y = Freq, x = Age)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Age', x = "Age", y = "Serology Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+# Make Age table
+sera_age0 <- subset(sera_test,sera_test$Age != 'Undetermined')
+sera_age0$Age <- factor(sera_age0$Age,levels = c('Fawn','Yearling','Adult'))
+sera_age1 <- data.frame(table(sera_age0$Age))
+colnames(sera_age1) <- c('Age','Counts')
+sera_age2 <- subset(sera_test,sera_test$svnt_result == 'pos')
+sera_age3 <- data.frame(table(sera_age2$Age))
+colnames(sera_age3) <- c('Age','Counts_Positive')
+sera_age3$Age <- as.character(sera_age3$Age)
+# Combine the data together.
+sera_age4 <- sera_age1
+sera_age4$Counts_Positive <- 0
+for(ii in 1:nrow(sera_age4)){
+  tt <- sera_age4$Age[ii]
+  temp <- subset(sera_age3,sera_age3$Age == tt)
+  if(nrow(temp) > 0){
+    sera_age4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+sera_age4$Age <- as.character(sera_age4$Age)
+sera_age4$Age[is.na(sera_age4$Age) | sera_age4$Age == ""] <- "Unknown"
+sera_age4$Percent_Positive <- paste0(as.character(round(sera_age4$Counts_Positive/sera_age4$Counts * 100,2)),'%')
+
+
+################ Serology by Sex Table
+
+#make count table
+AntibodyBySexTable <- data.frame(table(sera_test$svnt_result, sera_test$Gender))
+colnames(AntibodyBySexTable) <- c('svnt_result', "Sex", "Freq")
+
+#run t-test
+temp_sera_sex <- subset(sera_test,sera_test$Sex != 'Undetermined')
+table_sex <- table(temp_sera_sex$Sex, temp_sera_sex$svnt_result)
+prop_test_sera_sex <- prop.test(x = c(table_sex[1,2], table_sex[2,2]), 
+                           n = c(sum(table_sex[1,]), sum(table_sex[2,])))
+
+
+#begin barplots
+plot_sera_sex <- ggplot(AntibodyBySexTable, aes(fill = svnt_result, y = Freq, x = Sex)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Sex', x = "Sex", y = "Serology Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+# Make Sex table
+sera_sex0 <- subset(sera_test,sera_test$Sex != 'Undetermined')
+sera_sex1 <- data.frame(table(sera_sex0$Sex))
+colnames(sera_sex1) <- c('Sex','Counts')
+sera_sex2 <- subset(sera_test,sera_test$svnt_result == 'pos')
+sera_sex3 <- data.frame(table(sera_sex2$Sex))
+colnames(sera_sex3) <- c('Sex','Counts_Positive')
+sera_sex3$Sex <- as.character(sera_sex3$Sex)
+# Combine the data together.
+sera_sex4 <- sera_sex1
+sera_sex4$Counts_Positive <- 0
+for(ii in 1:nrow(sera_sex4)){
+  tt <- sera_sex4$Sex[ii]
+  temp <- subset(sera_sex3,sera_sex3$Sex == tt)
+  if(nrow(temp) > 0){
+    sera_sex4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+sera_sex4$Sex <- as.character(sera_sex4$Sex)
+sera_sex4$Sex[is.na(sera_sex4$Sex) | sera_sex4$Sex == ""] <- "Unknown"
+sera_sex4$Percent_Positive <- paste0(as.character(round(sera_sex4$Counts_Positive/sera_sex4$Counts * 100,2)),'%')
+
+################ Serology by Type of Death Table
+
+#make count table
+sera_test_death <- sera_test
+levels_death <- sort(unique(sera_test_death$Animalstatus))
+sera_test_death$Animalstatus <- factor(sera_test_death$Animalstatus,levels = levels_death)
+sera_death <- data.frame(table(sera_test_death$svnt_result, sera_test_death$Animalstatus))
+colnames(sera_death) <- c("svnt_result", "Animalstatus", "Freq")
+
+#run chi
+sera_table_death <- table(sera_test_death$Animalstatus,sera_test_death$svnt_result)
+# Perform the Chi-squared test
+sera_chi_death <- chisq.test(sera_table_death)
+# Run post hoc test
+sera_bon_post_hoc_death <- pairwise.prop.test(x = sera_table_death, p.adjust.method = "bonferroni")
+
+#begin barplots
+plot_sera_death <- ggplot(sera_death, aes(fill = svnt_result, y = Freq, x = Animalstatus)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Cause of Death', x = "Cause of Death", y = "Serology Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic()  +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+################ Serology by Season
+
+#make count table
+sera_test_sea <- sera_test
+levels_sea <- c('spring','summer','fall','winter')
+sera_test_sea$season <- factor(sera_test_sea$season,levels = levels_sea)
+sera_sea <- data.frame(table(sera_test_sea$svnt_result, sera_test_sea$season))
+colnames(sera_sea) <- c("svnt_result", "Season", "Freq")
+
+#run chi
+sera_table_sea <- table(sera_test_sea$season,sera_test_sea$svnt_result)
+# Perform the Chi-squared test
+sera_chi_sea <- chisq.test(sera_table_sea)
+# Run post hoc test
+sera_bon_post_hoc_sea <- pairwise.prop.test(x = sera_table_sea, p.adjust.method = "bonferroni")
+
+# Make Season table
+sera_sea0 <- subset(sera_test,sera_test$season != 'Undetermined')
+sera_sea1 <- data.frame(table(sera_sea0$season))
+colnames(sera_sea1) <- c('Season','Counts')
+sera_sea2 <- subset(sera_test,sera_test$svnt_result == 'pos')
+sera_sea3 <- data.frame(table(sera_sea2$season))
+colnames(sera_sea3) <- c('Season','Counts_Positive')
+sera_sea3$Season <- as.character(sera_sea3$Season)
+# Combine the data together.
+sera_sea4 <- sera_sea1
+sera_sea4$Counts_Positive <- 0
+for(ii in 1:nrow(sera_sea4)){
+  tt <- sera_sea4$Season[ii]
+  temp <- subset(sera_sea3,sera_sea3$Season == tt)
+  if(nrow(temp) > 0){
+    sera_sea4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+sera_sea4$Season <- as.character(sera_sea4$Season)
+sera_sea4$Season[is.na(sera_sea4$Season) | sera_sea4$Season == ""] <- "Unknown"
+sera_sea4$Percent_Positive <- paste0(as.character(round(sera_sea4$Counts_Positive/sera_sea4$Counts * 100,2)),'%')
+
+#begin barplots
+plot_sera_sea <- ggplot(sera_sea, aes(fill = svnt_result, y = Freq, x = Season)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(title = 'Season',x = "Season", y = "Serology Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic()  +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1),axis.title.x=element_blank(),plot.title = element_blank())
+
+
+################ Serology by Date of Death Table
+#make count table
+sera_table_date <- data.frame(table(sera_test$svnt_result, sera_test$IncidentDate))
+colnames(sera_table_date) <- c('svnt_result', "IncidentDate", "Freq")
+
+#subject to change by ADM
+plot_sera_death_time <- ggplot(sera_table_date, aes(fill = svnt_result, y = Freq, x = IncidentDate)) +
+  geom_bar(position = "stack", stat = "identity") +
+  labs(x = "Date of Death", y = "Serology Counts", fill = "Seropositivity") + 
+  scale_fill_manual(values = c("lightblue", "darkred"), labels = c("Negative", "Positive")) +
+  theme_classic() +
+  theme(legend.position = "none",axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Perform lineare regression to determine if there is a linear trend between sample collection and running the test.
+sera_dat1 <- sera_test
+sera_dat1$svnt_date <- as.Date(sera_dat1$svnt_date)
+sera_dat1$IncidentDate <- as.Date(sera_dat1$IncidentDate)
+sera_dat1$days_to_test <- as.numeric(sera_dat1$IncidentDate - sera_dat1$svnt_date)
+sera_dat1$binary <- ifelse(grepl("pos", sera_dat1$svnt_result, ignore.case = TRUE), 1, 0)
+sera_dat2 <- subset(sera_dat1,sera_dat1$sars_cov_2 == 'pos')
+sera_dat2 <- subset(sera_dat2,sera_dat2$days_to_test < (-30*6)) # Samples older than 6 months
+# Sample data creation for demonstration
+set.seed(123)
+
+# Determine what the linear regression for the data is.
+sera_days_reg <- lm(binary ~ days_to_test, data = sera_dat2)
+summary_sera_days_reg <- summary(sera_days_reg)
+# Extract the p-value for the 'days_to_test' variable specifically
+slope_p_value <- summary_sera_days_reg$coefficients["days_to_test", "Pr(>|t|)"]
+temp_title <- paste0('Seropositivity for \nqPCR Positives p=',as.character(round(slope_p_value,4)))
+
+# Creating the ggplot
+plot_sera_time_reg <- ggplot(sera_dat2, aes(x = days_to_test, y = binary)) +
+  geom_point() +  # Add points
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color = "black", fill = "lightgrey", alpha = 0.5) +
+  labs(x = "Collection Day to Test", y = "Seropositivity", title = temp_title) +
+  theme_classic() +  # Use a minimal theme
+  theme(
+    plot.title = element_text(hjust = 0.5),  # Center the plot title
+    plot.background = element_blank(),  # Remove background
+    legend.position = "none",  # Remove the legend
+  ) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("Neg", "Pos")) 
+
+# Make Cause of Death table
+sera_death0 <- subset(sera_test,sera_test$Animalstatus != 'Undetermined')
+sera_death1 <- data.frame(table(sera_death0$Animalstatus))
+colnames(sera_death1) <- c('Animalstatus','Counts')
+sera_death2 <- subset(sera_test,sera_test$svnt_result == 'pos')
+sera_death3 <- data.frame(table(sera_death2$Animalstatus))
+colnames(sera_death3) <- c('Animalstatus','Counts_Positive')
+sera_death3$Animalstatus <- as.character(sera_death3$Animalstatus)
+# Combine the data together.
+sera_death4 <- sera_death1
+sera_death4$Counts_Positive <- 0
+for(ii in 1:nrow(sera_death4)){
+  tt <- sera_death4$Animalstatus[ii]
+  temp <- subset(sera_death3,sera_death3$Animalstatus == tt)
+  if(nrow(temp) > 0){
+    sera_death4$Counts_Positive[ii] <- temp$Counts_Positive[1]
+  }
+}
+sera_death4$Animalstatus <- as.character(sera_death4$Animalstatus)
+sera_death4$Animalstatus[is.na(sera_death4$Animalstatus) | sera_death4$Animalstatus == ""] <- "Unknown"
+sera_death4$Percent_Positive <- paste0(as.character(round(sera_death4$Counts_Positive/sera_death4$Counts * 100,2)),'%')
+
+
+################################################################################
+# Bayesian County Positivity
+################################################################################
+# Function that formats the data into the correct format.
+format_deer_county <- function(met1){
+  temp1 <- met1
+
+  # Get the date format.
+  temp1$date_exact <- as.Date(temp1$IncidentDate)
+  # Remove any rows that are missing metadata.
+  temp1 <- temp1[!is.na(temp1$date_exact),]
+  # Get the date rounded to the first day of the week (Sunday).
+  weekday_numbers = as.integer(format(temp1$date_exact, "%w"))
+  # Subtract the weekday number from the date to get the previous Sunday
+  temp1$date <- temp1$date_exact - weekday_numbers
+
+  # Determine if it is a positive sample or not.
+  temp1$positive <- temp1$sars_cov_2
+
+  # Now add additional formatting to get the data ready for the model.
+  temp2 <- temp1
+  temp2$County.Location <- temp2$CountyValue
+  temp2$pos <- ifelse(temp2$positive == "pos", TRUE, FALSE)
+
+  # Clean the metadata further.
+  temp3 <- temp2
+  makeFirstLetterUpper <- function(x) {
+    if (nchar(x) > 0) {
+      paste0(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))))
+    } else {
+      x
+    }
+  }
+  # temp3 <- subset(temp3,temp3$Animalstatus != 'Dead - Targeted Removal')
+  temp3 <- subset(temp3,temp3$County.Location != 'UNK/OUT OF STATE')
+  temp3 <- subset(temp3,temp3$County.Location != '')
+  temp3$County.Location <- makeFirstLetterUpper(temp3$County.Location)
+  # temp3 <- subset(temp3,temp3$n1_person != '')
+  # temp3$pos<-temp3$N1.Ct!='Undetermined' | temp3$N2.Ct!='Undetermined'
+  # temp3$Region<-trimws(temp3$Region)
+  if(any(is.na(temp3$County.Location)|temp3$County.Location==''))stop('Deer with missing counties')
+
+  deer <- temp3
+  return(deer)
+}
+# All
+group <- 'All'
+deer <- format_deer_county(met4)
+options(mc.cores = parallel::detectCores())
+rstan::rstan_options(auto_write = TRUE)
+
+# Clean the metadata
+makeFirstLetterUpper <- function(x) {
+  if (nchar(x) > 0) {
+    paste0(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))))
+  } else {
+    x
+  }
+}
+deer$County.Location <- deer$CountyValue
+deer <- subset(deer,deer$Animalstatus != 'Dead - Targeted Removal')
+deer <- subset(deer,deer$County.Location != 'UNK/OUT OF STATE')
+deer <- subset(deer,deer$County.Location != '')
+deer$County.Location <- makeFirstLetterUpper(deer$County.Location)
+deer <- subset(deer,deer$sars_cov_2 != '')
+# deer$pos<-deer$N1.Ct!='Undetermined' | deer$N2.Ct!='Undetermined'
+deer$Region<-trimws(deer$Region)
+if(any(is.na(deer$County.Location)|deer$County.Location==''))stop('Deer with missing counties')
+  
+if(rerun == T){
+  #https://www.census.gov/geographies/reference-files/2010/geo/county-adjacency.html
+  adj<-read.table('county_adjacency.txt',sep='\t')
+  colnames(adj)<-c('county','id','neighbor','neighborId')
+  adj$county<-fillDown(adj$county)
+  adj<-adj[grepl(', PA$',adj$county)&grepl(', PA$',adj$neighbor),]
+  adj$simple<-sub(' County, PA','',adj$county)
+  adj$neighborSimple<-sub(' County, PA','',adj$neighbor)
+  if(any(!deer$County.Location %in% adj$simple))stop('Unknown county')
+  adjacencyAll<-table(adj$simple,adj$neighborSimple)
+  diag(adjacencyAll)<-0
+  adj<-adj[adj$simple %in% deer$County.Location &adj$neighborSimple %in% deer$County.Location,]
+  adjacency<-table(adj$simple,adj$neighborSimple)
+  diag(adjacency)<-0
+  
+  penn <- maps::map("county","Pennsylvania",plot=FALSE)
+  penn$prettyName<-sub('pennsylvania,','',penn$name)
+  substring(penn$prettyName,1,1)<-toupper(substring(penn$prettyName,1,1))
+  counts<-table(deer$County.Location,deer$pos)
+  
+  #https://mc-stan.org/users/documentation/case-studies/mbjoseph-CARStan.html
+  mod <- rstan::stan_model("counties_adjacent.stan")
+  stan<-runCountyStan(counts,adjacency,mod,nChain=4,nIter=500)
+  mat<-as.matrix(stan$stan)
+  props<-apply(invLogit(mat[,'overallProp']+mat[,grep('^countyProp\\[',colnames(mat))]),2,meanCrI)
+  colnames(props)<-sprintf('pennsylvania,%s',tolower(rownames(adjacency)))
+  if(any(!colnames(props) %in% penn$names))stop('Unknown county name')
+  
+  cols<-1+penn$names %in% colnames(props)
+  breaks<-seq(0,ceiling(max(props[1,])*10)/10,.005)
+  cuts<-cut(props[1,],breaks)
+  cuts2<-cut(props[2,],breaks)
+  nCut<-length(levels(cuts))
+  nCutTop<-0;nCutBottom<-150
+  propCol<-structure(tail(head(rev(colorRampPalette(c(viridis::rocket(30),'white'),space='Lab')(nCut+nCutTop+nCutBottom)),nCut+nCutTop),nCut),.Names=levels(cuts))
+  cols<-structure(propCol[cuts],.Names=colnames(props))[penn$names]
+  labels<-rep('',length(penn$prettyName))
+  select<-penn$prettyName %in% rownames(counts)
+  labels[select]<-sprintf('%s\n%d/%d',penn$prettyName[select],counts[penn$prettyName[select],'TRUE'],rowSums(counts[penn$prettyName[select],]))
+  
+  # Save the necessary files.
+  saveRDS(props, file = paste0(dir_data_main,prefix,'_temp_county_props_',suffix,'.rds'))
+  saveRDS(cols, file = paste0(dir_data_main,prefix,'_temp_county_cols_',suffix,'.rds'))
+  saveRDS(labels, file = paste0(dir_data_main,prefix,'_temp_county_labels_',suffix,'.rds'))
+  saveRDS(propCol, file = paste0(dir_data_main,prefix,'_temp_county_propCol_',suffix,'.rds'))
+  saveRDS(breaks, file = paste0(dir_data_main,prefix,'_temp_county_breaks_',suffix,'.rds'))
+}else{
+  # Open props
+  props <- readRDS(paste0(dir_data_main,prefix,'_temp_county_props_',suffix,'.rds'))
+  
+  # Open cols
+  cols <- readRDS(paste0(dir_data_main,prefix,'_temp_county_cols_',suffix,'.rds'))
+  
+  # Open labels
+  labels <- readRDS(paste0(dir_data_main,prefix,'_temp_county_labels_',suffix,'.rds'))
+  
+  # Open propCol
+  propCol <- readRDS(paste0(dir_data_main,prefix,'_temp_county_propCol_',suffix,'.rds'))
+  
+  # Open breaks
+  breaks <- readRDS(paste0(dir_data_main,prefix,'_temp_county_breaks_',suffix,'.rds'))
+}
+
+# # Savet the overall plot.
+# file_geo <- paste0(dir_data_main,prefix,'_plot_county-positivity-all_',suffix,'.pdf')
+# pdf(file_geo)
+# plot.new()
+# naCol <- '#EAEAEA'
+# maps::map("county", "Pennsylvania", col=ifelse(is.na(cols), naCol, cols), fill=TRUE)
+# maps::map.text("county", "Pennsylvania", add=TRUE, label=labels, cex=0.5)
+# insetScale(breaks + rep(c(0, .0001), c(length(breaks) - 1, 1)), propCol, main='Estimated proportion positive', insetPos = c(0.025, 0.1, 0.04, 0.3))
+# dev.off()
+
+# Plot all years with the Bayesian Adjustment
+file_geo_all <- paste0(dir_data_main,prefix,'_plot_county-positivity-bayesian_',suffix,'.pdf')
+get_geo_all(cols,labels,breaks,propCol,file_geo_all)
+
+# Plot 2021
+date_start <- as.Date('2021-01-01')
+date_stop <- as.Date('2022-01-01')
+plot_title <- 'Raw Positivity by County: 2021'
+file_geo_2021 <- paste0(dir_data_main,prefix,'_plot_county-positivity-2021_',suffix,'.pdf')
+get_geo_year(date_start,date_stop,met4,deer,file_geo_2021,plot_title)
+get_geo_year(date_start,date_stop,met4,deer,'temp_plot-1.pdf',plot_title)
+
+# Plot 2022
+date_start <- as.Date('2022-01-01')
+date_stop <- as.Date('2023-01-01')
+plot_title <- 'Raw Positivity by County: 2022'
+file_geo_2022 <-paste0(dir_data_main,prefix,'_plot_county-positivity-2022_',suffix,'.pdf')
+get_geo_year(date_start,date_stop,met4,deer,file_geo_2022,plot_title)
+get_geo_year(date_start,date_stop,met4,deer,'temp_plot-2.pdf',plot_title)
+
+# Plot 2023
+date_start <- as.Date('2023-01-01')
+date_stop <- as.Date('2024-01-01')
+plot_title <- 'Raw Positivity by County: 2023'
+file_geo_2023 <- paste0(dir_data_main,prefix,'_plot_county-positivity-2023_',suffix,'.pdf')
+get_geo_year(date_start,date_stop,met4,deer,file_geo_2023,plot_title)
+get_geo_year(date_start,date_stop,met4,deer,'temp_plot-3.pdf',plot_title)
+
+# Plot 2024
+date_start <- as.Date('2024-01-01')
+date_stop <- as.Date('2025-01-01')
+plot_title <- 'Raw Positivity by County: 2024'
+file_geo_2024 <- paste0(dir_data_main,prefix,'_plot_county-positivity-2024_',suffix,'.pdf')
+get_geo_year(date_start,date_stop,met4,deer,file_geo_2024,plot_title)
+get_geo_year(date_start,date_stop,met4,deer,'temp_plot-4.pdf',plot_title)
+
+################################################################################
+# Smoothed prevalence plot.
+################################################################################
+
+if(rerun == T){
+  
+  # Estimate positivity rate
+
+  # Open the data and reformat.
+  prev1 <- met1
+  prev1 <- subset(prev1, prev1$VSP != 'VSP30247') # For now remove the earliest sample since it is an outlier
+  # prev1 <- subset(prev1,prev1$CWD == 'neg')
+  prev2 <- format_deer_prev(prev1)
+  date_incl5 <- get_date(prev2)
+  
+  # Make groups for CWD
+  group <- 'All'
+  file_group <- get_all(prev2, group, dir_data_main,prefix,suffix)
+  bay5 <- bayesian_prep(file_group, date_incl5,dir_data_main,prefix,suffix)
+  file_plot_bayes <- bayesian_calculations(bay5,group,date_incl5,dir_data_main,prefix,suffix)
+  plot_prevalence_raw <- readRDS(file_plot_bayes[1])
+  plot_prevalence_smoothed <-  readRDS(file_plot_bayes[2]) 
+}else{
+  file_plot_prevalence_raw <- paste(dir_data_main,prefix,"_", tolower(group), "_plot_prevalence_raw","_",suffix,".rds", sep ="")
+  file_plot_prevalence_smoothed <- paste(dir_data_main,prefix,"_",suffix,"_", tolower(group), "_plot_prevalence_smooth","_",suffix,".rds", sep ="")
+  plot_prevalence_raw <- readRDS(file_plot_prevalence_raw)
+  plot_prevalence_smoothed <-  readRDS(file_plot_prevalence_smoothed) 
+}
+
+# Get the plots to compare CWD over time
+file_sta <- get_cwd_positivity(met1,dir_data_main,prefix,suffix)
+
+# file_sta <- get_cwd_positivity(met1,dir_data_main,prefix,suffix)
+plot_prevalence_n <- readRDS(file_sta[1])
+plot_prevalence_p <- readRDS(file_sta[2])
+sta_prop_test <- readRDS(file_sta[3])
+sta4 <- readRDS(file_sta[4])
+  
+mut_stan2 <- read.csv(paste0(dir_data_main,prefix,'_temp_prevalence_mut_stan2_',suffix,'.csv'))
+colnames(mut_stan2) <- c('Date','Proportion','2.5%','97.5%')
+mut_stan2$Date <- as.POSIXct(mut_stan2$Date)
+
+plot_prevalence_smoothed3 <- ggplot() +
+  geom_line(data = mut_stan2, aes(x=Date, y=Proportion, color="Proportion"), lwd = 1.01) +
+  geom_ribbon(data = mut_stan2, aes(x=Date, ymin = `2.5%`, ymax = `97.5%`), alpha = 0.1, fill = "black")+
+  scale_color_manual(name = "", values = c("Proportion" = "black"))+
+  scale_x_datetime(date_labels = "%b %Y", date_breaks = "2 months", date_minor_breaks = "1 month", expand = c(0, 0)) +
+  ylim(0, 1) + 
+  ylab("Proportion") + 
+  ggtitle('') + 
+  theme(axis.text = element_text(size = 12), axis.text.x = element_text(angle = 45, hjust=1.1),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "none", plot.title = element_blank())
+
+################################################################################
+# Get a summary table that has many metrics for each of the demographics and theit 95% confidence interval
+################################################################################
+
+# Tables to include:
+get_summary_table <- function(sta4, sex4, age3, death4, sea4, dat_pos, dat_neg){
+  
+  # Make a blank row to add between major group division.
+  coln <- c('group', 'total','positive')
+  table_sum_blank <- data.frame(matrix(NA, nrow = 1, ncol = length(coln)))
+  colnames(table_sum_blank) <- coln
+  
+  # Add overall positivity rate.
+  table_sum_all <- data.frame(matrix(NA, nrow = 1, ncol = length(coln)))
+  colnames(table_sum_all) <- coln
+  table_sum_all$group[1] <- 'All Data' 
+  table_sum_all$total[1] <- (nrow(dat_pos)+nrow(dat_neg))
+  table_sum_all$positive[1] <- nrow(dat_pos)
+  
+  # Add CWD status. # Remember that this groups is highly temporally dependent. Given a potential seasonal affect, this should only be
+  table_sum_cwd <- data.frame(matrix(NA, nrow = nrow(sta4), ncol = length(coln)))
+  colnames(table_sum_cwd) <- coln
+  table_sum_cwd$group <-  gsub('Positive','CWD Positive',gsub('Negative','CWD Negative',sta4$CWD)) # Report the group
+  table_sum_cwd$total <- sta4$Counts # Report the total counts
+  table_sum_cwd$positive <- sta4$Counts_Positive # Report the counts positive
+  
+  # Add season status.
+  table_sum_sea <- data.frame(matrix(NA, nrow = nrow(sea4), ncol = length(coln)))
+  colnames(table_sum_sea) <- coln
+  table_sum_sea$group <-  sea4$Season # Report the group
+  table_sum_sea$total <- sea4$Counts # Report the total counts
+  table_sum_sea$positive <- sea4$Counts_Positive # Report the counts positive
+  
+  # Add sex status.
+  table_sum_sex <- data.frame(matrix(NA, nrow = nrow(sex4), ncol = length(coln)))
+  colnames(table_sum_sex) <- coln
+  table_sum_sex$group <-  sex4$Sex # Report the group
+  table_sum_sex$total <- sex4$Counts # Report the total counts
+  table_sum_sex$positive <- sex4$Counts_Positive # Report the counts positive
+  
+  # Add age status.
+  table_sum_age <- data.frame(matrix(NA, nrow = nrow(age3), ncol = length(coln)))
+  colnames(table_sum_age) <- coln
+  table_sum_age$group <-  age3$Age # Report the group
+  table_sum_age$total <- age3$Counts # Report the total counts
+  table_sum_age$positive <- age3$Counts_Positive # Report the counts positive
+  
+  # Add death status.
+  table_sum_death <- data.frame(matrix(NA, nrow = nrow(death4), ncol = length(coln)))
+  colnames(table_sum_death) <- coln
+  table_sum_death$group <-  death4$Cause # Report the group
+  table_sum_death$total <- death4$Counts # Report the total counts
+  table_sum_death$positive <- death4$Counts_Positive # Report the counts positive
+  
+  # Concatenate all of the table together.
+  table_sum <- rbind(table_sum_all,table_sum_blank,
+                     table_sum_cwd,table_sum_blank,
+                     table_sum_sea,table_sum_blank,
+                     table_sum_age,table_sum_blank,
+                     table_sum_death,table_sum_blank,
+                     table_sum_sex)
+  
+  # Calculate the values for each of the rows.
+  table_sum$prevalence <- paste0(as.character(round((table_sum$positive / table_sum$total) * 100,2)),'%')
+  
+  # Calculate the 95% confidence interval.
+  # Add the 95% confidence interval
+  table_sum$ci_95 <- '0%-100%'
+  for(ii in 1:nrow(table_sum)){
+    if(!is.na(table_sum$total[ii])){
+      # Calculate the 95% Confidence Interval for psoitivity rate.
+        temp <- prop.test(table_sum$positive[ii],table_sum$total[ii])
+        temp_low <- as.character(paste0(round(100*temp$conf.int[1],2),'%'))
+        temp_high <- as.character(paste0(round(100*temp$conf.int[2],2),'%'))
+        
+        # Populate the data frame.
+        table_sum$ci_95[ii] <- paste0('(',temp_low,'-',temp_high,')')  
+        temp <- prop.test(table_sum$positive[ii],table_sum$total[ii])
+    }
+  }
+
+# Format the data frame so that it is all character objects and the blank rows remain as blank.
+table_sum <- data.frame(sapply(table_sum, as.character))
+table_sum[is.na(table_sum$group), ] <- lapply(table_sum[is.na(table_sum$group), ], function(x) rep("", length(x))) # Replace NA with blanks
+
+colnames(table_sum) <- c('Group','Total','Positive','Prevalence','95% CI')
+
+
+return(table_sum)
+
+}
+
+table_sum <- get_summary_table(sta4, sex4, age3, death4, sea4, dat_pos, dat_neg)
+
+
+# Attempt machine learning
+#' ################################################################################################
+#' load libraries and set seed
+#' ################################################################################################
+# library(tidyverse)
+# library(gt)
+# library(tidybayes)
+# library(brms)
+# library(marginaleffects)
+# library(dnar) # devtools::install_github('sherrillmix/dnar')
+
+# Specify the directory path
+dir_data_pos <- dir_data_main
+if (!dir.exists(dir_data_pos)) {
+  # Directory does not exist, so create it
+  dir.create(dir_data_pos, recursive = TRUE)
+}
+
+
+# Plot comparisons across three plots
+ml1 <-  met4[ , which(names(met4) %in% c('sars_cov_2','n1_batch','season','Age','CWD','Sex','Animalstatus','IncidentDate','n1_average_ct','Region'))]
+# Get the 7-day average temperature for the sample collection.
+ml1 <- subset(ml1,!is.na(ml1$IncidentDate))
+# # XXX Remove this just checking Ct 
+# ml1 <- subset(ml1,!is.na(ml1$n1_average_ct)) 
+ml1$temperature <- NA
+tem1 <- read.csv(file_temperture)
+for(ii in 1:nrow(ml1)){
+  # Subset to have the temperatures from the correct region.
+  tem_region <- ml1$Region[ii]
+  tem2 <- subset(tem1,tem1$REGION == tem_region)
+  
+  # Determine the date range to recover. 
+  tem2$date <- as.Date(tem2$DATE,format = '%Y-%m-%d')
+  tem_date <- ml1$IncidentDate[ii]
+  tem_list <- subset(tem2,tem2$date >= (tem_date-3)) # Get all that are 5 days before or later
+  tem_list <- subset(tem_list,tem_list$date < (tem_date+4)) # Get all that are 5 days after or earlier
+  
+  # Get the average of the max and min temps.
+  tem_list$temperature_average <- (tem_list$TMAX + tem_list$TMIN)/2 
+  
+  # Estimate the weekly average.
+  tem_avg <- mean(tem_list$temperature_average)
+  ml1$temperature[ii] <- tem_avg
+}
+udat <- ml1
+dat1 <- udat
+dat1$Sex <- as.character(dat1$Sex)
+dat1 <- subset(dat1,dat1$Sex != 'Undetermined')
+dat1 <- subset(dat1,dat1$season != 'Undetermined')
+
+dat_model <- dat1
+file_model_pos <- paste0(dir_data_pos,prefix,'_model_season-positivity_',suffix,'.rds')
+if(rerun == T){
+  m1_1 <- 
+  brm(data = dat_model,
+      formula = sars_cov_2 ~ Sex + season + temperature + (1 | Animalstatus),
+      family="bernoulli",
+      #prior = set_prior("normal(0,0.5)", class = "b"),
+      cores = 6,
+      chains = 4,
+      seed = 16,
+      control = list("adapt_delta" = 0.999, max_treedepth = 16),
+      file = paste0(dir_data_pos,prefix,'_model_season-positivity_',suffix),
+      file_refit = "on_change")
+
+  m1_1
+  
+  # Extract posterior samples
+  post_pos <- as.data.frame(posterior_samples(m1_1))
+
+  write.csv(post_pos,paste0(dir_data_pos,prefix,'_model_season-positivity_posterior_',suffix,'.csv'),row.names = F)
+  saveRDS(m1_1,file = file_model_pos)
+}
+post_pos <- read.csv(paste0(dir_data_pos,prefix,'_model_season-positivity_posterior_',suffix,'.csv'))
+m1_1 <- readRDS(file_model_pos)
+plot_pos_model <- plot(m1_1)[1]
+
+# Plotting the effects using bayesplot
+color_scheme_set("brightblue")
+vector_t <- colnames(post_pos)
+contains_key <- grepl("season", vector_t)
+filtered_vector <- vector_t[contains_key]
+plot_effect_season <- mcmc_areas(post_pos, pars = c(filtered_vector), prob = 0.95)
+
+# Determine what the 95% credible interval is.
+col <- c('variable','median','lower_95','upper_95')
+pos_c <- data.frame(matrix(NA, nrow = length(colnames(post_pos)), ncol = length(col)))
+colnames(pos_c) <- col
+pos_c$variable <- colnames(post_pos)
+for(ii in 1:nrow(pos_c)){
+  tt <- pos_c$variable[ii]
+  temp1 <- post_pos[,which(names(post_pos) %in% c(tt))]
+  pos_c$median[ii] <- median(temp1)
+  pos_c$lower_95[ii] <- quantile(temp1, 0.025)
+  pos_c$upper_95[ii] <- quantile(temp1, 0.975)
+}
+pos_c$median <- round(exp(pos_c$median),4)
+pos_c$lower_95 <- round(exp(pos_c$lower_95),4)
+pos_c$upper_95 <- round(exp(pos_c$upper_95),4)
+write.csv(pos_c,paste0(dir_data_main,prefix,'__summary','_',suffix,'.csv'),row.names = F)
+
+color_scheme_set("brightblue")
+vector_t <- colnames(post_pos)
+contains_key <- grepl("status", vector_t)
+filtered_vector <- vector_t[contains_key]
+plot_effect_death <- mcmc_areas(post_pos, pars = c(filtered_vector),prob = 0.95)
+
+# Color the effect of temperature on the sample.
+
+plot_temp_over_time <- ggplot(ml1, aes(x = IncidentDate, y = temperature, color = sars_cov_2)) +
+  geom_point(shape = 1) +  # Hollow circles
+  scale_color_manual(values = c("pos" = "darkred", "neg" = "lightblue")) +
+  labs(title = "Temperature by Incident Date Colored by SARS-CoV-2 Status",
+       x = "Date",
+       y = "Average Weekly Temperature",
+       color = "SARS-CoV-2 Status") +
+  theme_classic() +
+  theme(axis.text = element_text(color = "black"))  # Set axis text color to black
+
+
+ggsave(paste0(dir_data_main,prefix,'_plot_raw-temp-over-time_',suffix,'.pdf'),plot_temp_over_time,width = 6, height = 3)
+
+
+ml1$sars_cov_2 <- factor(ml1$sars_cov_2, levels = c("neg", "pos"))
+
+plot_temp_over_time <- ggplot(ml1, aes(x = IncidentDate, y = temperature, color = sars_cov_2)) +
+  geom_point(shape = 1) +  # Hollow circles
+  scale_color_manual(values = c("neg" = "lightblue", "pos" = "darkred")) +
+  labs(title = "Temperature by Incident Date Colored by SARS-CoV-2 Status",
+       x = "Date",
+       y = "Average Weekly Temperature",
+       color = "SARS-CoV-2 Status") +
+  theme_classic() +
+  theme(axis.text = element_text(color = "black"))
+
+plot_temp_over_time
+
+################################################################################
+# Analysis for Anatomy of the Lymph Node
+################################################################################
+# Specify the directory path
+dir_data_nod <- paste0(dir_data_main,'Anatomy-Of-The-Lymph-Node')
+if (!dir.exists(dir_data_nod)) {
+  # Directory does not exist, so create it
+  dir.create(dir_data_nod, recursive = TRUE)
+}
+
+# Clean the data
+noda1 <- met1
+noda5 <- get_clean_data_noda(noda1)
+row.names(noda5) <- NULL
+
+# Save the an intermediate data file.
+noda6 <- noda5[ , which(names(noda5) %in% c('sample','location','ct'))]
+
+# Run the stats on the raw Ct values.
+name <- 'Raw'
+
+# Plot the data by sample.
+colfunc <- colorRampPalette(c('red','black','orange','grey90','deeppink3'))
+picked_colors <- colfunc(length(unique(noda5$location)))
+noda5_plot <- noda5
+noda5_plot$ct[is.na(noda5_plot$ct)] <- 42
+noda5_plot$sample <- gsub('VSP30913','Negative VSP30913',noda5_plot$sample)
+plot_ana_sample_raw <- ggplot(noda5_plot, aes(x = sample, y = ct)) +
+  geom_boxplot(color = "black") +  # Set box plot color to black
+  geom_jitter(aes(color = location), width = 0.2, size = 1.5) +  # Color the dots based on 'location'
+  scale_color_manual(values = picked_colors) +  # Use custom colors
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),  # Rotate x axis labels and set color to black
+        axis.text.y = element_text(color = "black"),  # Y axis labels in black
+        axis.title.x = element_text(color = "black"),  # X axis title in black
+        axis.title.y = element_text(color = "black"),  # Y axis title in black
+        axis.ticks = element_line(color = "black"),  # Tick marks in black
+        legend.text = element_text(color = "black"),  # Legend text in black
+        legend.title = element_text(color = "black")) +  # Legend title in black
+  labs(title = paste0("Ct by Sample: ", name),
+       x = "Sample",
+       y = "Ct",
+       color = "Location")  # Add label for the color legend
+# plot_ana_sample_raw
+ggsave(paste0(dir_data_nod,'/',prefix,'_plot_ana-raw-by-sample_',suffix,'.pdf'),plot_ana_sample_raw,height = 3, width = 4)
+
+colfunc <- colorRampPalette(c('blue', 'grey90','orange','green','brown'))
+picked_colors <- colfunc(length(unique(noda5_plot$sample)))
+plot_ana_location <- ggplot(noda5_plot, aes(x = location, y = ct)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = sample), width = 0.2, size = 1.5) +  # Color the dots based on 'sample'
+  scale_color_manual(values = picked_colors) +  # Use custom colors
+  theme_classic() +
+  ylim(20, 42.5) + 
+  labs(title = '',
+       x = "Location",
+       y = "Ct",
+       color = "Sample") +  # Add label for the color legend
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),  # Rotate x axis labels and set color to black
+        axis.text.y = element_text(color = "black"),  # Y axis labels in black
+        axis.title.x = element_text(color = "black"),  # X axis title in black
+        axis.title.y = element_text(color = "black"),  # Y axis title in black
+        legend.text = element_text(color = "black"))  # Legend text in black
+ggsave(paste0(dir_data_nod,'/',prefix,'_plot_raw-ct-by-location_',suffix,'.pdf'),plot_ana_location,height = 3, width = 4)
+
+# Run the traditional statistics (ANOVA)
+noda_stat <- aov(ct ~ location + sample, data = noda5)
+
+# Run the stats on the figures.
+dat_model_noda <- noda5
+levels_location <- c('center','adipose', 'efferent', 'cranial_lateral', 'distal_medial', 'cranial_medial', 'exudate')
+dat_model_noda$location <- factor(dat_model_noda$location,levels = c(levels_location))
+
+if(rerun == T){
+  noda1_0 <- 
+    brm(data = dat_model_noda,
+        formula = ct ~ sample + location,
+        family="gaussian",
+        #prior = set_prior("normal(0,0.5)", class = "b"),
+        cores = 6,
+        chains = 4,
+        seed = 16,
+        control = list("adapt_delta" = 0.999, max_treedepth = 16),
+        file = paste0(dir_data_nod,'/',prefix,'_model_anatomy-node','_',suffix),
+        file_refit = "on_change")
+  
+  # noda1_0
+  saveRDS(noda1_0,paste0(dir_data_nod,'/',prefix,'_model_anatomy-node','_',suffix,'.rds'))
+}
+noda1_0 <- readRDS(paste0(dir_data_nod,'/',prefix,'_model_anatomy-node','_',suffix,'.rds'))
+
+# Extract posterior samples for the different VSPs
+posterior_samples_noda <- as.data.frame(posterior_samples(noda1_0))
+colnames(posterior_samples_noda) <- gsub('b_sample','',colnames(posterior_samples_noda))
+# Plotting the effects using bayesplot
+color_scheme_set("brightblue")
+# Plot the samples
+vector_t <- colnames(posterior_samples_noda)
+contains_key <- grepl("VSP", vector_t)
+filtered_vector <- vector_t[contains_key]
+plot_ana_effect_sample <- mcmc_areas(posterior_samples_noda, pars = c(filtered_vector), prob = 0.95) +
+  labs(x = 'Ct Effect Size', y = 'Sample') + 
+  theme(text=element_text(family="sans"))
+ggsave(paste0(dir_data_nod,'/',prefix,'_plot_effect-ct-by-sample_',suffix,'.pdf'),plot_ana_effect_sample,height = 3, width = 2)
+
+# Extract posterior samples for the different VSPs
+# Plotting the effects using bayesplot
+color_scheme_set("brightblue")
+# Plot the samples
+vector_t <- colnames(posterior_samples_noda)
+contains_key <- grepl("location", vector_t)
+filtered_vector <- vector_t[contains_key]
+plot_ana_effect_location <- mcmc_areas(posterior_samples_noda, pars = c(filtered_vector), prob = 0.95) + 
+  coord_flip() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = 'Location',x = 'Ct Effect Size') + 
+  theme(text=element_text(family="sans"))
+ggsave(paste0(dir_data_nod,'/',prefix,'_plot_effect-ct-by-location_',suffix,'.pdf'),plot_ana_effect_location,height = 3, width = 2)
+
+# Determine what the 95% credible interval is.
+col <- c('variable','median','lower_95','upper_95')
+ana_c <- data.frame(matrix(NA, nrow = length(colnames(posterior_samples_noda)), ncol = length(col)))
+colnames(ana_c) <- col
+ana_c$variable <- colnames(posterior_samples_noda)
+for(ii in 1:nrow(ana_c)){
+  tt <- ana_c$variable[ii]
+  temp1 <- posterior_samples_noda[,which(names(posterior_samples_noda) %in% c(tt))]
+  ana_c$median[ii] <- median(temp1)
+  ana_c$lower_95[ii] <- quantile(temp1, 0.025)
+  ana_c$upper_95[ii] <- quantile(temp1, 0.975)
+}
+ana_c$variable <- gsub('b_location','',ana_c$variable)
+write.csv(ana_c,paste0(dir_data_nod,'/',prefix,'_model_anatomy_summary_',suffix,'.csv'),row.names = F)
+
+################################################################################
+# Analysis for Comparison of the Lymph Nodes
+################################################################################
+# Open the data
+nod1 <- met1
+
+# Clean the data
+nod5 <- get_clean_data(nod1)
+
+# Save the an intermediate data file.
+nod6 <- nod5[ , which(names(nod5) %in% c('sample','location','ct'))]
+rownames(nod6) <- NULL
+write.csv(nod6,paste0(dir_data_nod,'/',prefix,'_data_node-intermediate_',suffix,'.csv'),na = '',row.names = F)
+
+# Run the stats on the raw Ct values.
+name <- 'Raw'
+plot_nod_raw <- get_stat(dir_data_nod,prefix,suffix,nod5,name)
+
+# Combine the files together
+# get_summary(dir_data_nod,prefix,suffix)
+
+# Compared to the average acrosss samples
+# Make a df that contains the average of all the data from above.
+nod7 <- get_normalized(nod5)
+nod8 <- nod7[!is.na(nod7$ct_original),]
+col <- colnames(nod8)
+nod_loc <- unique(nod8$location)
+nod_temp <- data.frame(matrix(NA, nrow = length(nod_loc), ncol = length(col)))
+colnames(nod_temp) <- col
+nod_temp$location <- nod_loc
+nod_temp$sample <- 'average'
+# Populate with the average across each condition
+for(ii in 1:nrow(nod_temp)){
+  tt <- nod_temp$location[ii]
+  temp1 <- subset(nod8,nod8$location == tt)
+  temp1 <- temp1[!is.na(temp1$ct_original),]
+  nod_temp$ct_original[ii] <- mean(temp1$ct_original)
+}
+nod9 <- rbind(nod8,nod_temp)
+nod9$sample <- factor(nod9$sample, levels = c('average',sort(unique(nod8$sample))))
+
+dat_model <- nod9
+levels_location <- c('core','surface')
+dat_model$location <- factor(dat_model$location,levels = c(levels_location))
+file_model_node <- paste0(dir_data_pos,'/',prefix,'_model_node_',suffix,'.rds')
+if(rerun == T){
+  a1_3 <- 
+  brm(data = dat_model,
+      formula = ct_original ~ sample + location,
+      family="gaussian",
+      #prior = set_prior("normal(0,0.5)", class = "b"),
+      cores = 6,
+      chains = 4,
+      seed = 16,
+      control = list("adapt_delta" = 0.999, max_treedepth = 16),
+      file = paste0(dir_data_nod,'/',prefix,'_model_node_',suffix),
+      file_refit = "on_change")
+  
+  # Extract posterior samples
+  post_nod <- as.data.frame(posterior_samples(a1_3))
+  write.csv(post_nod,paste0(dir_data_nod,'/',prefix,'_model_posterior-nodes_',suffix,'.csv'),row.names = F)
+  saveRDS(a1_3,file = file_model_node)
+
+}
+post_nod <- read.csv(paste0(dir_data_nod,'/',prefix,'_model_posterior-nodes_',suffix,'.csv'))
+a1_3 <- readRDS(file_model_node)
+
+# Plotting the effects using bayesplot
+color_scheme_set("brightblue")
+# Plot the samples
+colnames(post_nod) <- gsub('b_sample','',colnames(post_nod))
+vector_t <- colnames(post_nod)
+contains_key <- grepl("VSP", vector_t)
+filtered_vector <- vector_t[contains_key]
+plot_ana_samples <- mcmc_areas(post_nod, pars = c(filtered_vector),prob = 0.95)
+
+# Plot the location
+vector_t <- colnames(post_nod)
+contains_key <- grepl("location", vector_t)
+filtered_vector <- vector_t[contains_key]
+plot_ana_sites <- mcmc_areas(post_nod, pars = c(filtered_vector), prob = 0.95)
+
+# Determine what the 95% credible interval is.
+col <- c('variable','median','lower_95','upper_95')
+nod_c <- data.frame(matrix(NA, nrow = length(colnames(post_nod)), ncol = length(col)))
+colnames(nod_c) <- col
+nod_c$variable <- colnames(post_nod)
+for(ii in 1:nrow(nod_c)){
+  tt <- nod_c$variable[ii]
+  temp1 <- post_nod[,which(names(post_nod) %in% c(tt))]
+  nod_c$median[ii] <- median(temp1)
+  nod_c$lower_95[ii] <- quantile(temp1, 0.025)
+  nod_c$upper_95[ii] <- quantile(temp1, 0.975)
+}
+write.csv(nod_c,paste0(dir_data_nod,'/',prefix,'_data_node',suffix,'.csv'),row.names = F)
+
+# # Run the traditional stats on this.
+# nod_anova_loc <- aov(ct ~ location + sample, data = nod6) # This is incorrect because it should be a paired t test
+
+comp1 <- met1
+
+# Clean the data
+comp5 <- get_clean_data(comp1)
+comp5$ct[is.na(comp5$ct)] <-  40
+
+# Plot the data by sample.
+colfunc <- colorRampPalette(c('#b2a6f7','#a83260'))
+picked_colors <- colfunc(length(unique(comp5$location)))
+plot_core_surface <- ggplot(comp5, aes(x = sample, y = ct, fill = location, color = location)) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.5, 
+               fatten = 2, position = position_dodge(0.5), 
+               aes(fill = location, color = location)) + # Ensure 'color' is set in aes for dynamic coloring
+  geom_point(position = position_jitterdodge(), shape = 21) +
+  scale_fill_manual(values = picked_colors) +  # Use custom colors for the medians
+  scale_color_manual(values = picked_colors) +  # Use custom colors for the points and borders
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),  # Rotate x-axis labels and make them black
+        axis.text.y = element_text(color = "black")) +  # Make y-axis labels black
+  labs(title = "Ct Values by Location",
+       x = "Sample",
+       y = "Ct",
+       fill = "Location",  # Adjust legend title for fill
+       color = "Location") +  # Add label for the color legend
+  ylim(20, 45)
+
+ggsave(paste0(dir_data_nod,'/',prefix,'_plot_comp-core-vs-surface_',suffix,'.pdf'),plot_core_surface,width = 6, height = 3)
+
+# Save the an intermediate data file.
+comp6 <- comp5[ , which(names(comp5) %in% c('sample','location','ct','node_num'))]
+rownames(comp6) <- NULL
+write.csv(comp6,paste0(dir_data_nod,'/',prefix,'_data_node-core-vs-surface_',suffix,'.csv'),na = '',row.names = F)
+
+# Running a paired t test
+# Make a blank data frame that will hold the vectorized numbers to be tested.
+col <- c('sample','node_num', 'ct_core','ct_surface')
+tt_sam <- unique(comp6$sample)
+tt_node_num <- unique(comp6$node_num)
+tt1 <- data.frame(matrix(NA, nrow = length(tt_sam)*length(tt_node_num), ncol = length(col)))
+colnames(tt1) <- col
+tt1$sample <- rep(tt_sam,each = length(tt_node_num))
+tt1$node_num <- rep(tt_node_num, length(tt_sam))
+# Populate the data frame
+for(ii in 1:nrow(tt1)){
+  aa <- tt1$sample[ii]
+  bb <- tt1$node_num[ii]
+  temp1 <- subset(comp6,comp6$sample == aa)
+  temp2 <- subset(temp1,temp1$node_num == bb)
+  temp_core <- subset(temp2,temp2$location == 'core')
+  temp_surface <- subset(temp2,temp2$location == 'surface')
+  
+  tt1$ct_core[ii] <- temp_core$ct[1]
+  tt1$ct_surface[ii] <- temp_surface[1]
+}
+
+tt1$ct_core <- as.numeric(tt1$ct_core)
+tt1$ct_surface <- as.numeric(tt1$ct_surface)
+
+# # Uncomment these lines to remove any of the values that were NA
+# tt1$ct_core <- gsub(40, NA,tt1$ct_core)
+# tt1$ct_surface <- gsub(40, NA,tt1$ct_surface)
+# tt1 <- tt1[!is.na(tt1$ct_core),]
+# tt1 <- tt1[!is.na(tt1$ct_surface),]
+# 
+# tt1$ct_core <- as.numeric(tt1$ct_core)
+# tt1$ct_surface <- as.numeric(tt1$ct_surface)
+
+node_paired_ttest <- t.test(tt1$ct_core, tt1$ct_surface, paired = TRUE)
+
+# Compare the variation within samples to cariation among the locations.
+noda7 <- noda6
+noda7$ct <- noda7$ct
+noda7 <- noda7[!is.na(noda7$ct),]
+
+# Calculate the standard deviation within each sample
+sample_groups <- split(noda7$ct, noda7$sample)
+sample_sd <- sapply(sample_groups, sd)
+
+# Calculate the standard deviation within each location
+location_groups <- split(noda7$ct, noda7$location)
+location_sd <- sapply(location_groups, sd)
+
+# Calculate the average standard deviation within samples
+dat_ana_sample_sd <- mean(sample_sd)
+
+# Calculate the average standard deviation within locations
+dat_ana_location_sd <- mean(location_sd)
+
+
+
+```
+
+
+Report Generated: ```r as.character(format(Sys.Date(), "%m/%d/%Y"))```
+
+by Andrew D. Marques, Matthew Hogenauer, Natalie Bauer, Michelle Gibison, Beatrice DeMarco, Jennifer Hoy-Petersen, Ronald G. Collman, Roderick B. Gagne, and Frederic D. Bushman
+* Author order and list not complete
+
+# Intro
+
+In this study we study white-tailed deer infected with SARS-CoV-2 from 2021 to 2024. In this analysis we report on prevalence rates, outbreak locations, and demographics of infected samples. 
+
+We sampled ```r as.character(nrow(met4))``` white-tailed deer retropharyngeal lymph nodes collected from deceased deer between ```r as.character(dat_date_min)``` and ```r as.character(dat_date_max)``` representing ```r as.character(dat_county)``` counties within Pennsylvania.
+
+# Project Metrics
+
+Total number of deer samples biobanked:  ```r as.character(dat_biobank)```
+
+Tested by qPCR:   ```r as.character(dat_qpcr)```
+
+Attempted WGS:    ```r as.character(dat_wgs_attempt)```
+
+Successfully WGS:   ```r as.character(dat_wgs_success)```
+
+Attempted HiCt:   ```r as.character(dat_hict_attempt)```
+
+Failed HiCt PCR:    ```r as.character(dat_hict_failed_pcr)```   (qPCR positive but failed to produce a band)
+
+Failed HiCt Sanger:   ```r as.character(dat_hict_failed_sanger)``` (Had a band of approximate size but failed to yield Sanger results)
+
+Successfully HiCt:    ```r as.character(dat_hict_success)```
+
+Number of Variant calls:    ```r as.character(dat_hict_success)```   (```r as.character(dat_wgs_success)``` from WGS and from ```r as.character(dat_hict_final)``` from HiCt)
+
+Number of samples tested for serology:  ```r as.character(dat_sera_tests)```
+
+Number of seropositive samples:  ```r as.character(dat_sera_pos)```
+
+\newpage
+
+# Results
+
+Prevalence is estimated at ```r as.character(dat_rate)```% (```r as.character(nrow(subset(met4,met4$sars_cov_2 == 'pos')))``` of ```r as.character(nrow(met4))``` specimen were positive for SARS-CoV-2)
+
+## Positivity by Time
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_prevalence
+```
+\newpage
+
+A Bayesian autoregressive moving average logistic regression was implemented to smooth data and estimate SARS-CoV-2 positivity rates in Pennsylvania WTD populations. 
+
+$$
+P_{w} = \frac{e^{X_{w}}}{\sum_{j=1}^{n} e^{X_{j,w}}}
+$$
+
+$$
+X_{w} = X_{w-1} + change_{w}
+$$
+
+$$
+change_{w} \sim Normal(change_{w-1},\sigma)
+$$
+
+Where $P_{i,w}$ is the proportion positive for week $w$. The proportions for a given week are assumed to be centered around the proportions observed in the prior week plus the change term that is itself correlated with the change observed in the prior week. The prior for $\sigma \sim Gamma(1,2)$.
+
+## Poisitivty by Time
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_prevalence_smoothed3
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+grid.arrange(plot_prevalence_raw,plot_prevalence_smoothed, ncol = 1)
+```
+
+```{r echo=FALSE, fig.cap="Positive Specimen by Season", warning = FALSE, message = FALSE}
+pander(sea4, style = 'rmarkdown', justify = c(rep('left',(ncol(sea4)))), caption = "Season")
+```
+
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+plot_sea
+```
+
+Test for difference in Ct values (ANOVA with Tukey Post Hoc).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+summary(anova_result_sea)
+tukey_result_sea
+```
+
+Test for difference in proportion (Chi Squared with Bonferroni correction).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+chi_sea
+
+bon_post_hoc_sea
+```
+
+Linear Mixed Effect Model to Estimate Effect Size of Seasons:
+
+
+\[
+\text{logit} (P(\text{Positivity}_i = 1)) = \beta_0 + \beta_1 \text{Season}_i + \beta_2 \text{Sex}_i + \beta_3 \text{Temperature}_i + u_{\text{Death}_i}
+\]
+
+Cause of death is expected to be a random effect that influences the collection process. 
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+plot_effect_season
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+plot_temp_over_time
+```
+
+```{r echo=FALSE, fig.cap="Posterior Distribution for Positivity Model", warning = FALSE, message = FALSE}
+# Generate the table
+pander(pos_c, style = 'rmarkdown', justify = c(rep('left',(ncol(pos_c)))), caption = "Posterior Distribution for Positivity")
+```
+
+Assessing the model's ability to fit the data:
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=8.5, fig.height=11}
+plot_pos_model
+```
+  
+  
+\newpage
+
+## Poisitivty by County
+
+We estimated the proportion of SARS-CoV-2 WTD within each tested county using a Bayesian conditional autoregressive model to account for variable sampling among counties and potential similarities between neighboring counties. $y_i$ is the number of positive tests out of $n_i$ tests within each county i. $\alpha$ represents the proportion positive and $\beta$ represents the difference for each county. For priors, $\theta$ was given a uniform prior between 0 and 1, $\sigma$ ~ Gamma (1,1), and $\alpha$ ~ Normal (-2,10).
+
+$$
+y_i \sim Binomial(p_i,n_i)
+$$
+
+$$
+p_i = logit^{-1}(\alpha,\beta_i)
+$$
+
+$$
+\beta \sim Normal_{prec}(0,\frac{1}{\sigma}(D-\theta A))
+$$
+
+```{r echo=FALSE, fig.width=6, fig.height=6, warning=FALSE, message=FALSE}
+  # Plot
+  naCol <- '#EAEAEA'
+  maps::map("county", "Pennsylvania", col=ifelse(is.na(cols), naCol, cols), fill=TRUE)
+  maps::map.text("county", "Pennsylvania", add=TRUE, label=labels, cex=0.5)
+  insetScale(breaks + rep(c(0, .0001), c(length(breaks) - 1, 1)), propCol, main='Estimated proportion positive', insetPos = c(0.025, 0.1, 0.04, 0.3))
+```
+
+See supplemental plots at the end of this document for county-by-year plots.
+
+\newpage
+
+## Positivity by Age
+
+```{r echo=FALSE, fig.cap="Positive Specimen by Age", warning = FALSE, message = FALSE}
+# Generate the table
+pander(age3, style = 'rmarkdown', justify = c(rep('left',(ncol(age3)))), caption = "Positive Specimen by Age")
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+plot_age
+```
+
+Test for difference in Ct values (ANOVA with Tukey Post Hoc).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+summary(anova_result_age)
+tukey_result_age
+```
+
+Test for difference in proportion (Chi Squared with Bonferroni correction).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+chi_age
+chi_post_hoc_age
+```
+
+\newpage
+
+## Positivity by CWD Status
+
+CWD samples were collected during three discrete timepoints in 2021, 2022, and 2023. To account for the window of CWD sampling, we subset non-CWD samples of contemporaneous times and use those as the comparison group.
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE, fig.width=5, fig.height=8}
+grid.arrange(plot_prevalence_p,plot_prevalence_n, plot_prevalence_raw, plot_prevalence_smoothed3, ncol = 1)
+```
+
+```{r echo=FALSE, fig.cap="Positive Specimen by CWD Status", warning = FALSE, message = FALSE}
+# Generate the table
+pander(sta4, style = 'rmarkdown', justify = c(rep('left',(ncol(sta4)))), caption = "Positive Specimen by CWD Status")
+```
+
+Test for difference in proportion (proportion test).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sta_prop_test
+```
+
+Test for difference in Ct values (t test).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+t_test_result_cwd
+```
+
+\newpage
+
+## Positivity by Cause of Death
+
+```{r echo=FALSE, fig.cap="Cause of Death", warning = FALSE, message = FALSE}
+pander(death4, style = 'rmarkdown', justify = c(rep('left',(ncol(age3)))), caption = "Cause of Death")
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+plot_death
+```
+
+Test for difference in Ct values (ANOVA with Tukey Post Hoc).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+summary(anova_result_death)
+tukey_result_death
+```
+
+Test for difference in proportion (Chi Squared with Bonferroni correction).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE,fig.width=7, fig.height=4}
+chi_death
+
+bon_post_hoc_death
+```
+
+\newpage
+
+## Positivity by Sex
+
+```{r echo=FALSE, fig.cap="Positive Specimen by Sex", warning = FALSE, message = FALSE}
+# Generate the table
+pander(sex4, style = 'rmarkdown', justify = c(rep('left',(ncol(age3)))), caption = "Positive Specimen by Sex")
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_sex
+```
+
+Test for difference in Ct values (t test).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+t_test_result_sex
+```
+
+Test for difference in proportion (proportion test).
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+prop_test_sex
+```
+
+Report the SD for the Ct across sex.
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+aa <- subset(sex2,sex2$Sex == 'Male')
+aa <- subset(aa,!is.na(aa$n1_average_ct))
+print('Male SD:')
+sd(aa$n1_average_ct)
+
+aa <- subset(sex2,sex2$Sex == 'Female')
+aa <- subset(aa,!is.na(aa$n1_average_ct))
+print('Female SD:')
+sd(aa$n1_average_ct)
+```
+
+\newpage
+
+## Summary of qPCR Ct Data.
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE, fig.width=5, fig.height=7}
+grid.arrange(plot_qpcr_age,plot_age,plot_qpcr_death,plot_death, plot_qpcr_sex,plot_sex,plot_qpcr_sea,plot_sea, ncol = 2)
+```
+\newpage
+
+# Serology
+
+## Serology - Comparing qPCR to sVNT Assays
+
+```{r echo=FALSE, fig.cap="Compare SARS-CoV-2 Assays", warning = FALSE, message = FALSE}
+pander(sera_table_assays, style = 'rmarkdown', justify = c(rep('left',(ncol(sera_table_assays)))), caption = "SARS-CoV-2 qPCR vs sVNT Assays")
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sera_prop_test_assay
+```
+
+\newpage
+
+## Serology - Age
+
+```{r echo=FALSE, fig.cap="Serology Age", warning = FALSE, message = FALSE}
+pander(sera_age4, style = 'rmarkdown', justify = c(rep('left',(ncol(sera_age4)))), caption = "Seropositivity by Age")
+```
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+chi_sera_age
+```
+
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sera_chi_post_hoc_age
+```
+
+\newpage
+
+## Serology - Animal Sex
+
+```{r echo=FALSE, fig.cap="Serology Age", warning = FALSE, message = FALSE}
+pander(sera_sex4, style = 'rmarkdown', justify = c(rep('left',(ncol(sera_sex4)))), caption = "SARS-CoV-2 Serology by Sex")
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+prop_test_sera_sex
+```
+
+\newpage
+
+## Serology - Cause of Death
+
+```{r echo=FALSE, fig.cap="Serology Age", warning = FALSE, message = FALSE}
+pander(sera_death4, style = 'rmarkdown', justify = c(rep('left',(ncol(sera_death4)))), caption = "SARS-CoV-2 Serology by Cause of Death")
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sera_chi_death
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sera_bon_post_hoc_death
+```
+
+\newpage
+
+## Serology - Season
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sera_chi_sea
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+sera_bon_post_hoc_sea
+```
+
+\newpage
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE, fig.width=5, fig.height=11}
+grid.arrange(plot_sera_positivity_assays,plot_sera_time_reg,plot_sera_age,plot_qpcr_age, plot_sera_death,plot_qpcr_death,plot_sera_sex,plot_qpcr_sex,plot_sera_sea,plot_qpcr_sea, ncol = 2)
+```
+
+To test if time between sample collection and serology test attributes to changes in seropositivity (i.e. longer storage of samples before testing leads to reduced positivity) we compare all RT-qPCR positive samples and plot whether sero-positive or sero-negative. 
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_sera_time_reg
+```
+
+\newpage
+
+# Anatomy of the Lymph Node 
+
+## Raw Data for Lymph Node Sites
+
+Organized by location.
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_ana_location
+```
+
+Organized by sample.
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_ana_sample_raw
+```
+
+```{r echo=FALSE, fig.cap="Raw Data", warning = FALSE, message = FALSE}
+pander(noda5, style = 'rmarkdown', justify = c(rep('left',(ncol(noda5)))), caption = "")
+```
+
+## Traditional Statistical Test 
+
+To determine whether lymph node trimming sites result in a difference in Ct values
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+summary(noda_stat)
+```
+
+## Regression Model to Compare Lymph Node Sites Controlling for Sample Variation
+
+\[
+ct_{\text{i}} \sim \text{Normal}(\mu, \sigma)
+\]
+\[
+\mu = \alpha + \beta_{\text{Sample}} (\text{Sample}) + \beta_{\text{Location}} (\text{Location})
+\]
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_ana_effect_sample
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_ana_effect_location
+```
+
+```{r echo=FALSE, fig.cap="Raw Data", warning = FALSE, message = FALSE}
+pander(ana_c, style = 'rmarkdown', justify = c(rep('left',(ncol(ana_c)))), caption = "")
+```
+
+Examining the difference between the standard deviation within samples vs among locations:
+
+The average standard deviation within samples was calculated as ```r as.character(round(dat_ana_sample_sd),2)```.
+The average standard deviation among sample locations was calculated as ```r as.character(round(dat_ana_location_sd),2)```
+
+\newpage
+
+# Comparison of the Lymph Nodes
+
+In a separate experiment from the Anatomy of the Lymph Node, we tested if core (biopsied) vs surface (superficial trimming) resulted in changes of Ct values.
+
+## Surface vs Core Raw Data:
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_core_surface 
+```
+
+```{r echo=FALSE, fig.cap="Raw Data", warning = FALSE, message = FALSE}
+pander(comp6, style = 'rmarkdown', justify = c(rep('left',(ncol(comp6)))), caption = "")
+```
+
+## Traditional Statistical Test
+Compared if the core vs surface cuts yield significantly different Ct values.
+Paired t-test, across 8 samples known to be positive with duplicates done for both the core and the surface cuts.
+
+```{r echo=FALSE, fig.cap="Variable Effects on Ct", warning = FALSE, message = FALSE}
+node_paired_ttest
+```
+
+## Regression Model to Compare Lymph Node Core vs Sample Locations Controlling for Sample Variation
+
+Note: This is the same structure for the model used for the anatomy of the lymph node section.
+
+\[
+ct_{\text{i}} \sim \text{Normal}(\mu, \sigma)
+\]
+\[
+\mu = \alpha + \beta_{\text{Sample}} (\text{Sample}) + \beta_{\text{Location}} (\text{Location})
+\]
+
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_ana_sites
+```
+
+```{r echo=FALSE, fig.cap="", warning = FALSE, message = FALSE}
+plot_ana_samples
+```
+
+```{r echo=FALSE, fig.cap="Variable Effects on Ct", warning = FALSE, message = FALSE}
+pander(nod_c, style = 'rmarkdown', justify = c(rep('left',(ncol(nod_c)))), caption = "Posterior Distribution")
+```
+
+# Supplemental Tables
+
+```{r echo=FALSE, fig.cap="County Positivity", warning = FALSE, message = FALSE}
+pander(table_county2, style = 'rmarkdown', justify = c(rep('left',(ncol(county_df)))), caption = "County SARS-CoV-2 Positivity")
+```
+
+\newpage
+
+```{r echo=FALSE, fig.cap="Variants by County", warning = FALSE, message = FALSE}
+pander(table_var_county, style = 'rmarkdown', justify = c(rep('left',(ncol(table_var_county)))), caption = "SARS-CoV-2 Variants by County")
+```
+
+\newpage
+
+```{r echo=FALSE, fig.cap="Variants by Date", warning = FALSE, message = FALSE}
+pander(table_var_date, style = 'rmarkdown', justify = c(rep('left',(ncol(table_var_date)))), caption = "SARS-CoV-2 Variants by Date")
+```
+
+\newpage
+
+![](temp_plot-1.pdf) ![](temp_plot-2.pdf) ![](temp_plot-3.pdf) ![](temp_plot-4.pdf)
+
+\newpage
+
+```{r echo=FALSE, fig.cap="Demographic Summary", warning = FALSE, message = FALSE}
+pander(table_sum, style = 'rmarkdown', justify = c(rep('left',(ncol(table_sum)))), caption = "White-tailed Deer Demographic Summary for SARS-CoV-2 Positivity")
+```
